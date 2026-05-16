@@ -1,0 +1,12 @@
+[package]
+name = "dedicated_server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+game_sockets = { git = "https://github.com/VALERE91/game_sockets" }
+bevy = "0.18" 
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+shared = { path = "../shared" } 
