@@ -3,6 +3,21 @@ members = [
     "dedicated_server",
     "orchestrator",
     "gatekeeper",
-    "shared",
+    "shared", "client",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+axum = "0.8.9"
+bevy = "0.18" 
+game_sockets = { git = "https://github.com/VALERE91/game_sockets" }
+redis = { version = "1.2.1", features = ["tokio-comp"] }
+reqwest = { version = "0.13.3", features = ["json"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+shared = { path = "shared" }
+tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1.23.1", features = ["v4"] }
