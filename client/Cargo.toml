@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 bevy.workspace = true
+bytes.workspace = true
+game_sockets.workspace = true
 reqwest.workspace = true
 shared.workspace = true
 tokio.workspace = true

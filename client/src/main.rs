@@ -1,47 +1,29 @@
 use shared::*;
-/*
-async fn login_to_gatekeeper(
-    username: &str,
-    password: &str,
-) -> Result<LoginResponse, Box<dyn std::error::Error>> {
-    let base_url = "http://127.0.0.1:3000";
+use bevy::prelude::*;
 
-    let client = reqwest::Client::new();
+mod state;
+use crate::state::AppState;
 
-    // POST /login (vrai login)
-    let response = client
-        .post(format!("{}/login", base_url))
-        .json(&LoginRequest {
-            username: username.to_string(),
-            password: password.to_string(),
-        })
-        .send()
-        .await?
-        .json::<LoginResponse>()
-        .await?;
+mod login;
+use crate::login::*;
 
-    println!("Logged in successfully!");
-    println!("Token: {}", response.player_id);
-    println!(
-        "Game server: {}.{} -> {}",
-        response.server.ip, response.server.port, response.server.zone
-    );
+mod network;
+use crate::network::*;
 
-    Ok(response)
-}
-*/
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let gatekeeper_server = ServerInfo {
-        ip: String::from("127.0.0.1"),
-        port: 3000,
-        zone: String::from("N/A"),
+    let gatekeeper = GatekeeperInfo {
+        0: ServerInfo {
+            ip: String::from("127.0.0.1"),
+            port: 3000,
+            zone: String::from("N/A"),
+        }
     };
 
     // Requête GET /health
     println!("Is Gatekeeper alive ?");
 
-    let response = reqwest::get(gatekeeper_server.http_url("/health"))
+    let response = reqwest::get(gatekeeper.health_url())
         .await?
         .text()
         .await?;
@@ -52,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
 
     let response = client
-        .post(gatekeeper_server.http_url("/login"))
+        .post(gatekeeper.login_url())
         .json(&LoginRequest {
             username: String::from("Pierre"),
             password: String::from("1234"),
@@ -68,6 +50,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Game server: {}.{} -> {}",
         response.server.ip, response.server.port, response.server.zone
     );
+
+    App::new()
+        .add_plugins(DefaultPlugins)
+        //.add_plugins(GatekeeperLoginPlugin)
+        .add_plugins(NetworkPlugin)
+        .init_state::<AppState>()
+        .insert_resource(GameServerInfo {
+            0: response.server
+        })
+        .insert_state(AppState::Connecting)
+        //.add_systems(Update, handle_network)
+        .run();
 
     Ok(())
 }
