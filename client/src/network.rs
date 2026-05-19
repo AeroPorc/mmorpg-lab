@@ -1,12 +1,13 @@
 use shared::*;
 use bevy::prelude::*;
+//use bevy::ecs::event::Event;
 use game_sockets::protocols::UdpBackend;
-use game_sockets::{GamePeer, GameNetworkEvent, GameConnection, GameStream};
+use game_sockets::{GamePeer, GameNetworkEvent, /*GameConnection, GameStream,*/ GameStreamReliability};
+
 //use bytes::Bytes;
+//use uuid::Uuid;
 
 use crate::AppState;
-
-pub struct NetworkPlugin;
 
 #[derive(Resource)]
 pub struct GameServerInfo(pub ServerInfo);
@@ -29,6 +30,8 @@ pub struct NetworkSendEvent {
 }
 */
 
+pub struct NetworkPlugin;
+
 impl Plugin for NetworkPlugin {
     fn build(&self, app: &mut App) {
         let peer = GamePeer::new(UdpBackend::new());
@@ -36,27 +39,15 @@ impl Plugin for NetworkPlugin {
         app.insert_resource(NetworkClient { peer })
             //.add_event::<NetworkIncomingEvent>()
             //.add_event::<NetworkSendEvent>()
-            .add_systems(OnEnter(AppState::Connecting), (
-                bind_socket,
-                setup_connection,
-            ).chain());
-            /*
+            .add_systems(OnEnter(AppState::Connecting), setup_connection)
             .add_systems(Update, (
-                network_poll_system,
-                network_send_system,
-            ));
-            */
+                network_poll,
+            ).chain());
+            //.add_systems(OnExit(AppState::InGame), disconnection_handler);
     }
 }
 
-fn bind_socket(client: ResMut<NetworkClient>) {
-    if let Err(e) = client.peer.listen("127.0.0.1", 5001) {
-        error!("Failed to bind socket: {:?}", e);
-    } else {
-        println!("Client listening on 0.0.0.0:5000");
-    }
-}
-
+// Initiate connection with game server
 fn setup_connection(client: ResMut<NetworkClient>,
     game_server: ResMut<GameServerInfo>
 ) {
@@ -65,5 +56,50 @@ fn setup_connection(client: ResMut<NetworkClient>,
     } else {
         println!("Connecting to game server...");
     }
-    //client.peer.send(, , "lol");
 }
+
+pub fn network_poll(
+    mut client: ResMut<NetworkClient>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    while let Ok(Some(event)) = client.peer.poll() {
+        match event {
+            GameNetworkEvent::Connected(connection) => {
+                println!("Connected to server: {:?}", connection);
+                let _ = client.peer.create_stream(connection, GameStreamReliability::Unreliable);
+            }
+            GameNetworkEvent::Disconnected(connection) => {
+                println!("Disconnected from server: {:?}", connection);
+            }
+            GameNetworkEvent::Message { connection: _, stream: _, data } => {
+                println!("MSG = {:?}", data);
+            }
+            GameNetworkEvent::Error { connection: _connection, inner } => {
+                eprintln!("Error from server: {:?}", inner);
+            }
+            GameNetworkEvent::StreamCreated(connection, stream) => {
+                eprintln!("Stream created : {:?}", stream);
+                let _ = client.peer.send(&connection, &stream, "JOIN Pierre".into());
+                next_state.set(AppState::InGame);
+            }
+            GameNetworkEvent::StreamClosed(_, _) => {
+            }
+        }
+    }
+}
+
+/*
+fn disconnection_handler(
+    mut client: ResMut<NetworkClient>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    println!("Disconnecting from game server...");
+
+    // 1. fermer proprement le peer (envoie Shutdown + join thread)
+    if let Err(e) = client.peer.shutdown() {
+        eprintln!("Error during shutdown: {:?}", e);
+    }
+
+    next_state.set(AppState::Disconnected);
+}
+*/

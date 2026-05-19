@@ -86,7 +86,7 @@ fn receive_packets(
         match event {
             GameNetworkEvent::Connected(conn) => {
                 println!("New connection established: {:?}", conn.connection_id);
-                let _ = network.peer.create_stream(conn, GameStreamReliability::Reliable);
+                //let _ = network.peer.create_stream(conn, GameStreamReliability::Unreliable);
             }
             GameNetworkEvent::Disconnected(conn) => {
                 println!("Connection lost: {:?}", conn.connection_id);
