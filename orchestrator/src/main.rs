@@ -27,9 +27,9 @@ async fn main() {
         .parse()
         .unwrap_or(15);
     let scaler_interval: u64 = std::env::var(SCALER_INTERVAL)
-        .unwrap_or_else(|_| "10".to_string())
+        .unwrap_or_else(|_| "5000".to_string())
         .parse()
-        .unwrap_or(10);
+        .unwrap_or(5000);
     let redis_url = std::env::var(REDIS_URL).unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
     let socket = UdpSocket::bind(format!("0.0.0.0:{}", orch_port))
@@ -131,7 +131,7 @@ async fn scaler_loop(
         }
     };
 
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(interval_secs));
 
     loop {
         interval.tick().await;

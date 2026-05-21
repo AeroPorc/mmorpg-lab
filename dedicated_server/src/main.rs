@@ -58,7 +58,7 @@ fn main() {
         .add_plugins(MinimalPlugins)
         .insert_resource(ServerConfig::from_env())
         .init_resource::<PlayerRegistry>()
-        .add_systems(Startup, bind_sockets)
+        .add_systems(Startup, (bind_sockets, first_heartbeat).chain())
         .add_systems(Update, (receive_packets, send_heartbeat).chain())
         .run();
 }
@@ -81,6 +81,7 @@ fn receive_packets(
     mut network: ResMut<NetworkRes>,
     mut registry: ResMut<PlayerRegistry>,
     config: Res<ServerConfig>,
+    hb_res: Res<HeartbeatSocket>,
 ) {
     while let Ok(Some(event)) = network.peer.poll() {
         match event {
@@ -96,16 +97,24 @@ fn receive_packets(
                 let msg = String::from_utf8_lossy(&data);
                 let msg = msg.trim();
 
-                if msg.starts_with("JOIN") {
+                if msg.starts_with("JOIN ") {
                     let username = msg.replace("JOIN ", "").trim().to_string();
                     
+                    if registry.players.contains_key(&connection) {
+                        //println!("Player '{}' is already connected", username);
+                        continue;
+                    }
+
                     if registry.players.len() >= config.max_players {
                         let _ = network.peer.send(&connection, &stream, Bytes::from("REJECT Server Full"));
                         continue;
                     }
 
                     registry.players.insert(connection, PlayerInfo { username: username.clone() });
+
                     println!("Player '{}' joined the game!", username);
+
+                    update_status(&config, &hb_res, &registry);
 
                     let response = format!("WELCOME {}", connection.connection_id);
                     let _ = network.peer.send(&connection, &stream, Bytes::from(response));
@@ -131,6 +140,8 @@ fn send_heartbeat(
     if *timer >= 5.0 {
         *timer = 0.0;
 
+        update_status(&config, &hb_res, &registry);
+        /*
         let heartbeat = Heartbeat {
             id: config.id.clone(),
             ip: "127.0.0.1".to_string(), 
@@ -144,5 +155,34 @@ fn send_heartbeat(
             let _ = hb_res.socket.send_to(payload.as_bytes(), config.orchestrator_addr);
             println!("Heartbeat sent (Players: {}/{})", heartbeat.player_count, heartbeat.max_players);
         }
+        */
+    }
+}
+
+fn first_heartbeat(
+    config: Res<ServerConfig>,
+    hb_res: Res<HeartbeatSocket>,
+    registry: Res<PlayerRegistry>,
+) {
+    update_status(&config, &hb_res, &registry);
+}
+
+fn update_status(
+    config: &ServerConfig,
+    hb_res: &HeartbeatSocket,
+    registry: &PlayerRegistry,
+) {
+    let heartbeat = Heartbeat {
+        id: config.id.clone(),
+        ip: "127.0.0.1".to_string(),
+        port: config.port,
+        zone: config.zone.clone(),
+        player_count: registry.players.len(),
+        max_players: config.max_players,
+    };
+
+    if let Ok(payload) = serde_json::to_string(&heartbeat) {
+        let _ = hb_res.socket.send_to(payload.as_bytes(), config.orchestrator_addr);
+        println!("Heartbeat sent (Server: {}, Players: {}/{})", config.port, heartbeat.player_count, heartbeat.max_players);
     }
 }

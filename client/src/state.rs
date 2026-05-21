@@ -6,5 +6,6 @@ pub enum AppState {
     Login,
     Connecting,
     InGame,
-    //Disconnected,
+    Rejected,
+    Disconnected,
 }

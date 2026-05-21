@@ -2,7 +2,7 @@ use shared::*;
 use bevy::prelude::*;
 //use bevy::ecs::event::Event;
 use game_sockets::protocols::UdpBackend;
-use game_sockets::{GamePeer, GameNetworkEvent, /*GameConnection, GameStream,*/ GameStreamReliability};
+use game_sockets::{GamePeer, GameNetworkEvent, GameConnection, GameStream, GameStreamReliability};
 
 //use bytes::Bytes;
 //use uuid::Uuid;
@@ -16,6 +16,9 @@ pub struct GameServerInfo(pub ServerInfo);
 pub struct NetworkClient {
     //pub player_id,
     pub peer: GamePeer,
+    pub connection: Option<GameConnection>,
+    pub reliable_stream: Option<GameStream>,
+    pub unreliable_stream: Option<GameStream>,
 }
 
 /*
@@ -36,13 +39,17 @@ impl Plugin for NetworkPlugin {
     fn build(&self, app: &mut App) {
         let peer = GamePeer::new(UdpBackend::new());
 
-        app.insert_resource(NetworkClient { peer })
+        app.insert_resource(NetworkClient { 
+                peer, 
+                connection: None,
+                reliable_stream: None,
+                unreliable_stream : None,
+            })
             //.add_event::<NetworkIncomingEvent>()
             //.add_event::<NetworkSendEvent>()
             .add_systems(OnEnter(AppState::Connecting), setup_connection)
-            .add_systems(Update, (
-                network_poll,
-            ).chain());
+            .add_systems(Update, connection_request.run_if(in_state(AppState::Connecting)))
+            .add_systems(Update, network_poll);
             //.add_systems(OnExit(AppState::InGame), disconnection_handler);
     }
 }
@@ -58,6 +65,22 @@ fn setup_connection(client: ResMut<NetworkClient>,
     }
 }
 
+pub fn connection_request(
+    client: ResMut<NetworkClient>,
+) {
+    match &client.connection {
+        Some(connection) => {
+            match &client.reliable_stream {
+                Some(stream) => {
+                    let _ = client.peer.send(&connection, &stream, "JOIN Caillou".into());
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+}
+
 pub fn network_poll(
     mut client: ResMut<NetworkClient>,
     mut next_state: ResMut<NextState<AppState>>,
@@ -66,21 +89,46 @@ pub fn network_poll(
         match event {
             GameNetworkEvent::Connected(connection) => {
                 println!("Connected to server: {:?}", connection);
-                let _ = client.peer.create_stream(connection, GameStreamReliability::Unreliable);
+                client.connection = Some(connection);
+                let _ = client.peer.create_stream(connection, GameStreamReliability::Reliable);
             }
             GameNetworkEvent::Disconnected(connection) => {
                 println!("Disconnected from server: {:?}", connection);
+                
+                client.connection = None;
+                client.reliable_stream = None;
+                client.unreliable_stream = None;
+
+                next_state.set(AppState::Disconnected);
             }
-            GameNetworkEvent::Message { connection: _, stream: _, data } => {
+            GameNetworkEvent::Message { connection: _connection, stream, data } => {
                 println!("MSG = {:?}", data);
+
+                if stream.is_reliable() {
+                    let msg = String::from_utf8_lossy(&data);
+                    let msg = msg.trim();
+
+                    if msg.starts_with("WELCOME ") { // Welcomed by the dedicated server -> officially connected
+                        //let username = msg.replace("WELCOME ", "").trim().to_string();
+                        next_state.set(AppState::InGame);
+                    }
+                    if msg.starts_with("REJECT ") { // Rejected by the dedicated server -> server is full, must try another server
+                        next_state.set(AppState::Rejected);
+                    }
+                } else {
+                    println!("GameplayMessgage !");
+                }
             }
             GameNetworkEvent::Error { connection: _connection, inner } => {
                 eprintln!("Error from server: {:?}", inner);
             }
-            GameNetworkEvent::StreamCreated(connection, stream) => {
+            GameNetworkEvent::StreamCreated(_connection, stream) => {
                 eprintln!("Stream created : {:?}", stream);
-                let _ = client.peer.send(&connection, &stream, "JOIN Pierre".into());
-                next_state.set(AppState::InGame);
+                if stream.is_reliable() {
+                    client.reliable_stream = Some(stream);
+                } else {
+                    client.unreliable_stream = Some(stream);
+                }
             }
             GameNetworkEvent::StreamClosed(_, _) => {
             }
