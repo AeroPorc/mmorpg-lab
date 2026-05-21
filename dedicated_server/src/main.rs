@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bytes::Bytes;
 use game_sockets::protocols::UdpBackend;
-use game_sockets::{GameConnection, GameNetworkEvent, GamePeer, GameStreamReliability};
+use game_sockets::{GameConnection, GameNetworkEvent, GamePeer, /*GameStreamReliability*/};
 use shared::Heartbeat;
 use std::collections::HashMap;
 use std::env;
@@ -26,8 +26,8 @@ impl ServerConfig {
             id: Uuid::new_v4().to_string(),
             port,
             zone: env::var("DS_ZONE").unwrap_or_else(|_| "zone_A".to_string()),
-            max_players: 100,
-            orchestrator_addr: "127.0.0.1:8000"
+            max_players: 1,
+            orchestrator_addr: "0.0.0.0:6000"
                 .parse()
                 .expect("Invalid orchestrator address"),
         }

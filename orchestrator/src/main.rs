@@ -92,18 +92,20 @@ async fn heartbeat_listener(socket: Arc<UdpSocket>, redis_url: String, ttl: usiz
                         } else {
                             "available"
                         };
+                        
+                        let _: Result<(), _> = conn.hset_multiple(
+                            &server_key,
+                            &[
+                                ("id", heartbeat.id),
+                                ("ip", heartbeat.ip),
+                                ("port", heartbeat.port.to_string()),
+                                ("zone", heartbeat.zone),
+                                ("player_count", heartbeat.player_count.to_string()),
+                                ("max_players", heartbeat.max_players.to_string()),
+                                ("status", status.to_string()),
+                            ],
+                        );
 
-                        let server_data = serde_json::json!({
-                            "id": heartbeat.id,
-                            "ip": heartbeat.ip,
-                            "port": heartbeat.port,
-                            "zone": heartbeat.zone,
-                            "player_count": heartbeat.player_count,
-                            "max_players": heartbeat.max_players,
-                            "status": status
-                        });
-
-                        let _: Result<(), _> = conn.hset(&server_key, "data", server_data.to_string());
                         let _: Result<(), _> = conn.expire(&server_key, ttl as i64);
                     }
                 }
@@ -153,34 +155,31 @@ async fn scaler_loop(
 }
 
 fn count_available_servers(conn: &mut redis::Connection) -> usize {
-    let keys: Vec<String> = match redis::cmd("SCAN")
-        .arg(0)
-        .arg("MATCH")
-        .arg("server:*")
-        .query(conn)
+    let (_cursor, keys): (u64, Vec<String>) = match redis::cmd("SCAN")
+    .arg(0)
+    .arg("MATCH")
+    .arg("server:*")
+    .query(conn)
     {
         Ok(result) => result,
-        Err(_) => return 0,
+        Err(err) => {
+            eprintln!("SCAN error: {:?}", err);
+            return 0;
+        }
     };
 
     let mut available = 0;
 
     for key in keys {
         let status: Result<String, _> = conn.hget(&key, "status");
-        if let Ok(s) = status {
-            if s == "available" {
-                available += 1;
-            }
-        } else {
-            let data: Result<String, _> = conn.hget(&key, "data");
-            if let Ok(data_str) = data {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data_str) {
-                    if let Some(status_val) = json.get("status") {
-                        if status_val.as_str() == Some("available") {
-                            available += 1;
-                        }
-                    }
+        match status {
+            Ok(s) => {
+                if s == "available" {
+                    available += 1;
                 }
+            }
+            Err(err) => {
+                eprintln!("HGET error for {}: {:?}", key, err);
             }
         }
     }

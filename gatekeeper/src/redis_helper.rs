@@ -8,11 +8,15 @@ pub async fn find_available_server(
     let keys: Vec<String> = conn.keys("server:*").await?;
 
     for key in keys {
-        let ip: String = conn.hget(&key, "ip").await?;
-        let port: u16 = conn.hget(&key, "port").await?;
-        let zone: String = conn.hget(&key, "zone").await?;
+        let status: String = conn.hget(&key, "status").await?;
+        
+        if status == "available" {        
+            let ip: String = conn.hget(&key, "ip").await?;
+            let port: u16 = conn.hget(&key, "port").await?;
+            let zone: String = conn.hget(&key, "zone").await?;
 
-        return Ok(Some((ip, port, zone)));
+            return Ok(Some((ip, port, zone)));
+        }
     }
 
     Ok(None)
