@@ -1,56 +1,47 @@
 use bevy::prelude::*;
 use bytes::Bytes;
 use game_sockets::protocols::UdpBackend;
-use game_sockets::{GameConnection, GameNetworkEvent, GamePeer, /*GameStreamReliability*/};
-use shared::Heartbeat;
+use game_sockets::{GameConnection, GameNetworkEvent, GamePeer, GameStream, GameStreamReliability};
 use std::collections::HashMap;
 use std::env;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use uuid::Uuid;
 
 #[derive(Resource)]
 pub struct ServerConfig {
     pub id: String,
-    pub port: u16,
-    pub zone: String,
-    pub max_players: usize,
-    pub orchestrator_addr: SocketAddr,
+    pub shard_id: u32, 
+    pub broker_addr: SocketAddr,
 }
 
 impl ServerConfig {
     fn from_env() -> Self {
-        let port_str = env::var("DS_PORT").unwrap_or_else(|_| "7001".to_string());
-        let port: u16 = port_str.parse().expect("DS_PORT must be a valid number");
-
         Self {
             id: Uuid::new_v4().to_string(),
-            port,
-            zone: env::var("DS_ZONE").unwrap_or_else(|_| "zone_A".to_string()),
-            max_players: 1,
-            orchestrator_addr: "0.0.0.0:6000"
+            shard_id: env::var("SHARD_ID").unwrap_or_else(|_| "0".to_string()).parse().unwrap(),
+            broker_addr: env::var("BROKER_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:7002".to_string())
                 .parse()
-                .expect("Invalid orchestrator address"),
+                .expect("Invalid broker address"),
         }
     }
 }
 
-pub struct PlayerInfo {
-    pub username: String,
+pub struct PlayerState {
+    pub position: Vec2,
+    pub state: String, 
 }
 
 #[derive(Resource, Default)]
 pub struct PlayerRegistry {
-    pub players: HashMap<GameConnection, PlayerInfo>,
+    pub players: HashMap<u32, PlayerState>,
 }
 
 #[derive(Resource)]
-pub struct NetworkRes {
+pub struct BrokerConnection {
     pub peer: GamePeer,
-}
-
-#[derive(Resource)]
-pub struct HeartbeatSocket {
-    pub socket: UdpSocket,
+    pub connection: Option<GameConnection>,
+    pub stream: Option<GameStream>,
 }
 
 fn main() {
@@ -58,131 +49,111 @@ fn main() {
         .add_plugins(MinimalPlugins)
         .insert_resource(ServerConfig::from_env())
         .init_resource::<PlayerRegistry>()
-        .add_systems(Startup, (bind_sockets, first_heartbeat).chain())
-        .add_systems(Update, (receive_packets, send_heartbeat).chain())
+        .add_systems(Startup, connect_to_broker)
+        .add_systems(Update, (poll_broker, simulate_and_publish).chain())
         .run();
 }
 
-fn bind_sockets(mut commands: Commands, config: Res<ServerConfig>) {
-    let bind_addr = "0.0.0.0";
-    
+fn connect_to_broker(mut commands: Commands, config: Res<ServerConfig>) {
     let backend = UdpBackend::new();
     let peer = GamePeer::new(backend);
-    
-    peer.listen(bind_addr, config.port).expect("Failed to bind GamePeer");
-    println!("🚀 Dedicated Server [{}] listening on {}:{}", config.id, bind_addr, config.port);
-    commands.insert_resource(NetworkRes { peer });
 
-    let hb_socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind heartbeat socket");
-    commands.insert_resource(HeartbeatSocket { socket: hb_socket });
+    let broker_ip = config.broker_addr.ip().to_string();
+    let broker_port = config.broker_addr.port();
+
+    match peer.connect(&broker_ip, broker_port) {
+        Ok(_) => println!("Shard {} attempting connection to broker at {}:{}", config.shard_id, broker_ip, broker_port),
+        Err(e) => eprintln!("Failed to connect to broker: {:?}", e),
+    }
+
+    commands.insert_resource(BrokerConnection {
+        peer,
+        connection: None,
+        stream: None,
+    });
 }
 
-fn receive_packets(
-    mut network: ResMut<NetworkRes>,
+fn poll_broker(
+    mut broker: ResMut<BrokerConnection>,
     mut registry: ResMut<PlayerRegistry>,
     config: Res<ServerConfig>,
-    hb_res: Res<HeartbeatSocket>,
 ) {
-    while let Ok(Some(event)) = network.peer.poll() {
+    while let Ok(Some(event)) = broker.peer.poll() {
         match event {
             GameNetworkEvent::Connected(conn) => {
-                println!("New connection established: {:?}", conn.connection_id);
-                //let _ = network.peer.create_stream(conn, GameStreamReliability::Unreliable);
+                println!("Connected to Broker! Connection ID: {:?}", conn.connection_id);
+                broker.connection = Some(conn);
+                let _ = broker.peer.create_stream(conn, GameStreamReliability::Unreliable);
             }
-            GameNetworkEvent::Disconnected(conn) => {
-                println!("Connection lost: {:?}", conn.connection_id);
-                registry.players.remove(&conn);
+            GameNetworkEvent::StreamCreated(_conn, stream) => {
+                println!("Broker stream created.");
+                broker.stream = Some(stream);
             }
-            GameNetworkEvent::Message { connection, stream, data } => {
-                let msg = String::from_utf8_lossy(&data);
-                let msg = msg.trim();
+            GameNetworkEvent::Disconnected(_) => {
+                println!("Lost connection to Broker.");
+                broker.connection = None;
+                broker.stream = None;
+            }
+            GameNetworkEvent::Message { data, .. } => {
+                if data.is_empty() { continue; }
+                let tag = data[0];
 
-                if msg.starts_with("JOIN ") {
-                    let username = msg.replace("JOIN ", "").trim().to_string();
-                    
-                    if registry.players.contains_key(&connection) {
-                        //println!("Player '{}' is already connected", username);
-                        continue;
+                match tag {
+                    0x05 => {
+                        if data.len() >= 5 {
+                            let client_id = u32::from_le_bytes(data[1..5].try_into().unwrap());
+                            
+                            registry.players.entry(client_id).or_insert(PlayerState {
+                                position: Vec2::ZERO,
+                                state: "Owned".to_string(),
+                            });
+
+                            println!("Received input from client: {}", client_id);
+                        }
                     }
-
-                    if registry.players.len() >= config.max_players {
-                        let _ = network.peer.send(&connection, &stream, Bytes::from("REJECT Server Full"));
-                        continue;
+                    _ => {
+                        println!("Received unknown tag from broker: {}", tag);
                     }
-
-                    registry.players.insert(connection, PlayerInfo { username: username.clone() });
-
-                    println!("Player '{}' joined the game!", username);
-
-                    update_status(&config, &hb_res, &registry);
-
-                    let response = format!("WELCOME {}", connection.connection_id);
-                    let _ = network.peer.send(&connection, &stream, Bytes::from(response));
                 }
             }
-            GameNetworkEvent::Error { connection, inner } => {
-                eprintln!("Error on connection {:?}: {}", connection.connection_id, inner);
+            GameNetworkEvent::Error { inner, .. } => {
+                eprintln!("Broker connection error: {:?}", inner);
             }
-            _ => {} 
+            _ => {}
         }
     }
 }
 
-fn send_heartbeat(
-    time: Res<Time>,
-    mut timer: Local<f32>,
-    config: Res<ServerConfig>,
-    hb_res: Res<HeartbeatSocket>,
+fn simulate_and_publish(
+    broker: Res<BrokerConnection>,
     registry: Res<PlayerRegistry>,
+    config: Res<ServerConfig>,
 ) {
-    *timer += time.delta_secs();
+    if let (Some(conn), Some(stream)) = (&broker.connection, &broker.stream) {
+        
+        for (&client_id, player_state) in registry.players.iter() {
+            let mut payload: Vec<u8> = Vec::new();
+            payload.push(0x10);
+            payload.extend_from_slice(&client_id.to_le_bytes());
+            payload.extend_from_slice(&player_state.position.x.to_le_bytes());
+            payload.extend_from_slice(&player_state.position.y.to_le_bytes());
 
-    if *timer >= 5.0 {
-        *timer = 0.0;
+            let mut packet: Vec<u8> = Vec::new();
+            packet.push(0x03);
+            
+            let topic_str = format!("shard:{}", config.shard_id);
+            let mut topic_bytes = [0u8; 32];
+            let tb = topic_str.as_bytes();
+            let copy_len = std::cmp::min(tb.len(), 32);
+            topic_bytes[..copy_len].copy_from_slice(&tb[..copy_len]);
+            
+            packet.extend_from_slice(&topic_bytes);
+            
+            let payload_len = payload.len() as u16;
+            packet.extend_from_slice(&payload_len.to_le_bytes());
+            packet.extend_from_slice(&payload);
 
-        update_status(&config, &hb_res, &registry);
-        /*
-        let heartbeat = Heartbeat {
-            id: config.id.clone(),
-            ip: "127.0.0.1".to_string(), 
-            port: config.port,
-            zone: config.zone.clone(),
-            player_count: registry.players.len(),
-            max_players: config.max_players,
-        };
-
-        if let Ok(payload) = serde_json::to_string(&heartbeat) {
-            let _ = hb_res.socket.send_to(payload.as_bytes(), config.orchestrator_addr);
-            println!("Heartbeat sent (Players: {}/{})", heartbeat.player_count, heartbeat.max_players);
+            let _ = broker.peer.send(conn, stream, Bytes::from(packet));
         }
-        */
-    }
-}
-
-fn first_heartbeat(
-    config: Res<ServerConfig>,
-    hb_res: Res<HeartbeatSocket>,
-    registry: Res<PlayerRegistry>,
-) {
-    update_status(&config, &hb_res, &registry);
-}
-
-fn update_status(
-    config: &ServerConfig,
-    hb_res: &HeartbeatSocket,
-    registry: &PlayerRegistry,
-) {
-    let heartbeat = Heartbeat {
-        id: config.id.clone(),
-        ip: "127.0.0.1".to_string(),
-        port: config.port,
-        zone: config.zone.clone(),
-        player_count: registry.players.len(),
-        max_players: config.max_players,
-    };
-
-    if let Ok(payload) = serde_json::to_string(&heartbeat) {
-        let _ = hb_res.socket.send_to(payload.as_bytes(), config.orchestrator_addr);
-        println!("Heartbeat sent (Server: {}, Players: {}/{})", config.port, heartbeat.player_count, heartbeat.max_players);
     }
 }
