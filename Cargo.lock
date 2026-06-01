@@ -2074,6 +2074,7 @@ name = "client"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bytes",
  "game_sockets",
  "reqwest",
  "shared",

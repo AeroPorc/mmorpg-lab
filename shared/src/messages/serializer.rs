@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub struct Serializer {
-    buffer: BytesMut,
+    pub buffer: BytesMut,
 }
 
 impl Serializer {

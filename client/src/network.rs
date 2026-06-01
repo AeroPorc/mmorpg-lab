@@ -23,14 +23,7 @@ pub struct NetworkClient {
 
 /*
 #[derive(Event, Debug)]
-pub struct NetworkIncomingEvent(pub GameNetworkEvent);
-
-#[derive(Event, Debug)]
-pub struct NetworkSendEvent {
-    pub connection: GameConnection,
-    pub stream: GameStream,
-    pub data: Bytes,
-}
+pub struct NetworkMessageEvent(pub GameNetworkEvent);
 */
 
 pub struct NetworkPlugin;
@@ -45,8 +38,7 @@ impl Plugin for NetworkPlugin {
                 reliable_stream: None,
                 unreliable_stream : None,
             })
-            //.add_event::<NetworkIncomingEvent>()
-            //.add_event::<NetworkSendEvent>()
+            //.add_event::<NetworkMessageEvent>()
             .add_systems(OnEnter(AppState::Connecting), setup_connection)
             .add_systems(Update, connection_request.run_if(in_state(AppState::Connecting)))
             .add_systems(Update, network_poll);
