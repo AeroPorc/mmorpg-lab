@@ -3,7 +3,7 @@ members = [
     "dedicated_server",
     "orchestrator",
     "gatekeeper",
-    "shared", "client",
+    "shared", "client", "broker",
 ]
 resolver = "2"
 

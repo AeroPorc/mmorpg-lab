@@ -1,5 +1,5 @@
 mod handlers;
-mod redis_helper;
+//mod redis_helper;
 
 use shared::ServerInfo;
 
