@@ -119,7 +119,7 @@ pub fn network_poll(
                 if stream.is_reliable() {
                     client.reliable_stream = Some(stream);
                 } else {
-                    client.unreliable_stream = Some(stream);
+                    client.unreliable_stream = Some(stream); // Stream used to publish inputs for now (can be extended for other streams later on if needed)
                 }
             }
             GameNetworkEvent::StreamClosed(_, _) => {

@@ -57,7 +57,7 @@ pub async fn login_handler(
 
         server: ServerInfo {
             ip: "127.0.0.1".to_string(),
-            port: 5115,
+            port: 5000,
             zone: "N/A".to_string(),
         },
     }))
