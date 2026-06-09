@@ -17,7 +17,7 @@ pub async fn health_handler() -> &'static str {
 
 // Handle login requests -> ask redis for an available dedicated game server then return it to the player with a new player_id
 pub async fn login_handler(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, StatusCode> {
 
@@ -32,6 +32,7 @@ pub async fn login_handler(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    /*
     // Redis request
     let server =
         crate::redis_helper::find_available_server(&state.redis)
@@ -48,15 +49,16 @@ pub async fn login_handler(
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
+    */
 
     // Response containing player_id and the dedicated game server
     Ok(Json(LoginResponse {
         player_id: Uuid::new_v4().to_string(),
 
         server: ServerInfo {
-            ip,
-            port,
-            zone,
+            ip: "127.0.0.1".to_string(),
+            port: 5000,
+            zone: "N/A".to_string(),
         },
     }))
 }

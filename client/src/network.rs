@@ -23,14 +23,7 @@ pub struct NetworkClient {
 
 /*
 #[derive(Event, Debug)]
-pub struct NetworkIncomingEvent(pub GameNetworkEvent);
-
-#[derive(Event, Debug)]
-pub struct NetworkSendEvent {
-    pub connection: GameConnection,
-    pub stream: GameStream,
-    pub data: Bytes,
-}
+pub struct NetworkMessageEvent(pub GameNetworkEvent);
 */
 
 pub struct NetworkPlugin;
@@ -45,8 +38,7 @@ impl Plugin for NetworkPlugin {
                 reliable_stream: None,
                 unreliable_stream : None,
             })
-            //.add_event::<NetworkIncomingEvent>()
-            //.add_event::<NetworkSendEvent>()
+            //.add_event::<NetworkMessageEvent>()
             .add_systems(OnEnter(AppState::Connecting), setup_connection)
             .add_systems(Update, connection_request.run_if(in_state(AppState::Connecting)))
             .add_systems(Update, network_poll);
@@ -127,7 +119,7 @@ pub fn network_poll(
                 if stream.is_reliable() {
                     client.reliable_stream = Some(stream);
                 } else {
-                    client.unreliable_stream = Some(stream);
+                    client.unreliable_stream = Some(stream); // Stream used to publish inputs for now (can be extended for other streams later on if needed)
                 }
             }
             GameNetworkEvent::StreamClosed(_, _) => {

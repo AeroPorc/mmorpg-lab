@@ -1897,6 +1897,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "broker"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "game_sockets",
+ "shared",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2074,6 +2083,7 @@ name = "client"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bytes",
  "game_sockets",
  "reqwest",
  "shared",
@@ -5916,6 +5926,7 @@ dependencies = [
 name = "shared"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "serde",
 ]
 
