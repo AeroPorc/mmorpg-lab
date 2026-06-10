@@ -1,7 +1,7 @@
 use shared::ServerInfo;
 
 use game_sockets::protocols::UdpBackend;
-use game_sockets::{GamePeer, GameNetworkEvent, GameConnection, GameStream, GameStreamReliability};
+use game_sockets::{GamePeer, GameNetworkEvent, /*GameConnection, GameStream, GameStreamReliability*/};
 
 use bytes::Bytes;
 
@@ -26,7 +26,6 @@ fn main() {
         match event {
             GameNetworkEvent::Connected(conn) => {
                 println!("New connection established: {:?}", conn.connection_id);
-                broker.register_service(conn);
             }
             GameNetworkEvent::Disconnected(conn) => {
                 println!("Connection lost: {:?}", conn.connection_id);
@@ -37,6 +36,8 @@ fn main() {
                 let msg = msg.trim();
 
                 if msg.starts_with("JOIN ") {
+                    broker.register_service(connection, stream.clone());
+                    
                     let response = format!("WELCOME t");
                     let _ = broker.peer.send(&connection, &stream, Bytes::from(response));
                     /*

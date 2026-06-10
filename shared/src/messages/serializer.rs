@@ -1,5 +1,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use super::topics::Topic;
+
+
 pub struct Serializer {
     pub buffer: BytesMut,
 }
@@ -50,6 +53,23 @@ impl Serializer {
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.buffer.extend_from_slice(bytes);
     }
+
+    pub fn write_topic(&mut self, topic: &Topic) {
+        match topic {
+            Topic::Input(id) => {
+                self.write_u8(0);
+                self.write_u32(*id);
+            }
+            Topic::Snapshot(id) => {
+                self.write_u8(1);
+                self.write_u32(*id);
+            }
+            Topic::View(id) => {
+                self.write_u8(2);
+                self.write_u32(*id);
+            }
+        }
+    }
 }
 
 pub struct Deserializer {
@@ -91,6 +111,18 @@ impl Deserializer {
         let bytes = self.buffer.copy_to_bytes(len);
 
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    pub fn read_topic(&mut self) -> Topic {
+        let kind = self.read_u8();
+        let id = self.read_u32();
+
+        match kind {
+            0 => Topic::Input(id),
+            1 => Topic::Snapshot(id),
+            2 => Topic::View(id),
+            _ => panic!("Invalid Topic variant"),
+        }
     }
 
     pub fn remaining(&self) -> usize {

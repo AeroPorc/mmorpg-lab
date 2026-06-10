@@ -83,6 +83,7 @@ pub fn network_poll(
                 println!("Connected to server: {:?}", connection);
                 client.connection = Some(connection);
                 let _ = client.peer.create_stream(connection, GameStreamReliability::Reliable);
+                let _ = client.peer.create_stream(connection, GameStreamReliability::Unreliable);
             }
             GameNetworkEvent::Disconnected(connection) => {
                 println!("Disconnected from server: {:?}", connection);

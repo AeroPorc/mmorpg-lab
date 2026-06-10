@@ -1,10 +1,15 @@
 use super::serializer::{Serializer, Deserializer};
+use super::topics::Topic;
+
+
+use game_sockets::{/*GamePeer, GameConnection, */GameStream};
 
 #[repr(u8)]
 pub enum MessageId {
     Chat = 0,
     Input = 1,
     Snapshot = 2,
+    PubSub = 3,
 }
 
 impl MessageId {
@@ -13,6 +18,7 @@ impl MessageId {
             0 => Some(Self::Chat),
             1 => Some(Self::Input),
             2 => Some(Self::Snapshot),
+            3 => Some(Self::PubSub),
             _ => None,
         }
     }
@@ -171,5 +177,73 @@ impl NetMessage for SnapshotMessage {
         Self {
             tmp_val: deserializer.read_u8(),
         }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum PubSubOp {
+    Pub = 0,
+    ForcedPub = 1,
+    Sub = 2,
+    ForcedSub = 3,
+    Unsub = 4,
+    Helo = 5,
+    End = 6,
+    Err = 7,
+}
+
+pub struct PubSubMessage {
+    pub op: PubSubOp,
+    pub topic: Topic,
+    pub stream: Option<GameStream>,
+}
+
+impl NetMessage for PubSubMessage {
+    const ID: MessageId = MessageId::PubSub;
+
+    fn serialize(&self, serializer: &mut Serializer) {
+        // 1. op
+        serializer.write_u8(self.op as u8);
+
+        // 2. topic
+        serializer.write_topic(&self.topic);
+
+        // 3. stream 
+        match &self.stream {
+            Some(stream) => {
+                serializer.write_bool(true);
+                serializer.write_u16(stream.stream_id);
+            }
+            None => {
+                serializer.write_bool(false);
+            }
+        }
+    }
+
+    fn deserialize(deserializer: &mut Deserializer) -> Self {
+        let op_u8 = deserializer.read_u8();
+
+        let op = match op_u8 {
+            0 => PubSubOp::Pub,
+            1 => PubSubOp::ForcedPub,
+            2 => PubSubOp::Sub,
+            3 => PubSubOp::ForcedSub,
+            4 => PubSubOp::Unsub,
+            5 => PubSubOp::Helo,
+            6 => PubSubOp::End,
+            _ => PubSubOp::Err,
+        };
+
+        let topic = deserializer.read_topic();
+        
+        let stream = match deserializer.read_bool() {
+            true => Some(GameStream {
+                stream_id: deserializer.read_u16(),
+            }),
+            false => None,
+        };
+
+        Self { op, topic, stream }
     }
 }
