@@ -1,7 +1,6 @@
 use bevy::prelude::*;
 
-use shared::messages::serializer::*;
-use shared::messages::netmessage::{NetMessage, Input, InputMessage};
+use shared::messages::netmessage::{send_msg, Input, InputMessage};
 
 use crate::AppState;
 use crate::NetworkClient;
@@ -38,8 +37,6 @@ fn handle_inputs(
     };
 
     input_msg.0.push(input);
-    let mut serializer = Serializer::new();
-    input_msg.0.serialize(&mut serializer);
 
     let Some(connection) = client.connection.as_ref() else {
         return;
@@ -49,5 +46,10 @@ fn handle_inputs(
         return;
     };
 
-    let _ = client.peer.send(connection, stream, serializer.buffer.into());
+    // Désormais factorisé dans la fonction send_msg de la shared library
+    //let mut serializer = Serializer::new();
+    //input_msg.0.serialize(&mut serializer);
+    //let _ = client.peer.send(connection, stream, serializer.buffer.into());
+
+    let _ = send_msg(&client.peer, &connection, &stream, &input_msg.0);
 }

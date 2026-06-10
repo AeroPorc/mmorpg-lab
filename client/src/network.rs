@@ -1,11 +1,9 @@
 use shared::*;
+use shared::messages::netmessage::{send_msg, decode_msg, AnyMessage, PubSubMessage, PubSubOp};
 use bevy::prelude::*;
-//use bevy::ecs::event::Event;
+
 use game_sockets::protocols::UdpBackend;
 use game_sockets::{GamePeer, GameNetworkEvent, GameConnection, GameStream, GameStreamReliability};
-
-//use bytes::Bytes;
-//use uuid::Uuid;
 
 use crate::AppState;
 
@@ -94,10 +92,34 @@ pub fn network_poll(
 
                 next_state.set(AppState::Disconnected);
             }
-            GameNetworkEvent::Message { connection: _connection, stream, data } => {
+            GameNetworkEvent::Message { connection, stream, data } => {
                 println!("MSG = {:?}", data);
 
                 if stream.is_reliable() {
+                    if let Some(AnyMessage::PubSub(pubsub_msg)) = decode_msg(&data) {
+                        match pubsub_msg.op {
+                            PubSubOp::ForcedPub => { // if asked to pub a topic
+                                let pub_msg = PubSubMessage {
+                                    op: PubSubOp::Pub,
+                                    topic: pubsub_msg.topic,
+                                    stream: client.unreliable_stream.clone(),
+                                };
+
+                                let _ = send_msg(&client.peer, &connection, &stream, &pub_msg);
+                            }
+                            PubSubOp::ForcedSub => { // if asked to sub to a topic
+                                let sub_msg = PubSubMessage {
+                                    op: PubSubOp::Sub,
+                                    topic: pubsub_msg.topic,
+                                    stream: client.unreliable_stream.clone(),
+                                };
+
+                                let _ = send_msg(&client.peer, &connection, &stream, &sub_msg);
+                            }
+                            _ => {}
+                        }
+                    }
+
                     let msg = String::from_utf8_lossy(&data);
                     let msg = msg.trim();
 
