@@ -5927,6 +5927,7 @@ name = "shared"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "game_sockets",
  "serde",
 ]
 
