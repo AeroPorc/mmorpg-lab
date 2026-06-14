@@ -1,11 +1,17 @@
+use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 use bytes::Bytes;
 use game_sockets::protocols::UdpBackend;
 use game_sockets::{GameConnection, GameNetworkEvent, GamePeer, GameStream, GameStreamReliability};
+use shared::messages::netmessage::{decode_msg, send_msg, AnyMessage, PubSubMessage, PubSubOp};
+use shared::messages::topics::Topic;
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
+use std::time::Duration;
 use uuid::Uuid;
+
+const TICK_HZ: f64 = 20.0;
 
 const SHARD_WIDTH: f32 = 256.0;
 const HANDOFF_MARGIN: f32 = 24.0;
@@ -15,7 +21,7 @@ const STATE_BYTES: usize = 64;
 #[derive(Resource)]
 pub struct ServerConfig {
     pub id: String,
-    pub shard_id: u32, 
+    pub shard_id: u32,
     pub broker_addr: SocketAddr,
 }
 
@@ -33,7 +39,7 @@ impl ServerConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AuthorityState {
+pub enum AuthorityState {
     Owned,
     PendingHandoff,
     Ghost,
@@ -58,17 +64,44 @@ pub struct PlayerRegistry {
 pub struct BrokerConnection {
     pub peer: GamePeer,
     pub connection: Option<GameConnection>,
-    pub stream: Option<GameStream>,
+    pub reliable_stream: Option<GameStream>,
+    pub unreliable_stream: Option<GameStream>,
+    pub joined: bool,
+    pub welcomed: bool,
+    pub registered: bool,
 }
 
 fn main() {
     App::new()
-        .add_plugins(MinimalPlugins)
+        .add_plugins(
+            MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(1.0 / TICK_HZ))),
+        )
         .insert_resource(ServerConfig::from_env())
         .init_resource::<PlayerRegistry>()
-        .add_systems(Startup, connect_to_broker)
-        .add_systems(Update, (poll_broker, simulate_and_publish).chain())
+        .add_systems(Startup, (connect_to_broker, maybe_spawn_test_entity))
+        .add_systems(Update, (poll_broker, drive_broker_session, simulate_and_publish).chain())
         .run();
+}
+
+fn maybe_spawn_test_entity(mut registry: ResMut<PlayerRegistry>, config: Res<ServerConfig>) {
+    if env::var("SPAWN_DUMMY").is_err() {
+        return;
+    }
+
+    let client_id = 100 * config.shard_id + 1;
+    let position = default_spawn_position(config.shard_id, client_id);
+    registry.players.insert(
+        client_id,
+        PlayerState {
+            position,
+            velocity: Vec2::new(ENTITY_SPEED, 0.0), 
+            authority: AuthorityState::Owned,
+            handoff_target: None,
+            handoff_ticks: 0,
+            state_blob: [0u8; STATE_BYTES],
+        },
+    );
+    println!("Spawned test entity {} at {:?} (SPAWN_DUMMY).", client_id, position);
 }
 
 fn connect_to_broker(mut commands: Commands, config: Res<ServerConfig>) {
@@ -86,38 +119,41 @@ fn connect_to_broker(mut commands: Commands, config: Res<ServerConfig>) {
     commands.insert_resource(BrokerConnection {
         peer,
         connection: None,
-        stream: None,
+        reliable_stream: None,
+        unreliable_stream: None,
+        joined: false,
+        welcomed: false,
+        registered: false,
     });
 }
 
-fn topic_name(shard_id: u32) -> String {
-    format!("shard:{}", shard_id)
+
+fn publish_gameplay(broker: &BrokerConnection, payload: &[u8]) {
+    if let (Some(conn), Some(stream)) = (&broker.connection, &broker.unreliable_stream) {
+        let _ = broker.peer.send(conn, stream, Bytes::copy_from_slice(payload));
+    }
 }
 
-fn topic_bytes(topic: &str) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    let raw = topic.as_bytes();
-    let copy_len = std::cmp::min(raw.len(), bytes.len());
-    bytes[..copy_len].copy_from_slice(&raw[..copy_len]);
-    bytes
+fn send_control(broker: &BrokerConnection, op: PubSubOp, topic: Topic) {
+    if let (Some(conn), Some(reliable)) = (&broker.connection, &broker.reliable_stream) {
+        let msg = PubSubMessage {
+            op,
+            topic,
+            stream: broker.unreliable_stream.clone(),
+        };
+        let _ = send_msg(&broker.peer, conn, reliable, &msg);
+    }
 }
 
-fn encode_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(1 + 32 + 2 + payload.len());
-    packet.push(0x03);
-    packet.extend_from_slice(&topic_bytes(topic));
-    packet.extend_from_slice(&(payload.len() as u16).to_le_bytes());
-    packet.extend_from_slice(payload);
-    packet
+fn publish_entity_position(broker: &BrokerConnection, client_id: u32, entity: &PlayerState) {
+    let mut payload = Vec::with_capacity(1 + 4 + 4 + 4);
+    payload.push(0x10);
+    payload.extend_from_slice(&client_id.to_le_bytes());
+    payload.extend_from_slice(&entity.position.x.to_le_bytes());
+    payload.extend_from_slice(&entity.position.y.to_le_bytes());
+    publish_gameplay(broker, &payload);
 }
 
-fn encode_subscribe(client_id: u32, topic: &str) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(1 + 4 + 32);
-    packet.push(0x01);
-    packet.extend_from_slice(&client_id.to_le_bytes());
-    packet.extend_from_slice(&topic_bytes(topic));
-    packet
-}
 
 fn build_state_blob(entity: &PlayerState) -> [u8; STATE_BYTES] {
     let mut blob = [0u8; STATE_BYTES];
@@ -172,6 +208,7 @@ fn encode_handoff_complete(entity_id: u32) -> Vec<u8> {
     encode_handoff_ack(0x24, entity_id)
 }
 
+
 fn shard_bounds(shard_id: u32) -> (f32, f32) {
     let left = shard_id as f32 * SHARD_WIDTH;
     (left, left + SHARD_WIDTH)
@@ -197,40 +234,6 @@ fn ensure_player(registry: &mut PlayerRegistry, client_id: u32, shard_id: u32) -
         handoff_ticks: 0,
         state_blob: [0u8; STATE_BYTES],
     })
-}
-
-fn send_packet(peer: &GamePeer, connection: &GameConnection, stream: &GameStream, packet: Vec<u8>) {
-    let _ = peer.send(connection, stream, Bytes::from(packet));
-}
-
-fn send_topic_payload(peer: &GamePeer, connection: &GameConnection, stream: &GameStream, topic: &str, payload: &[u8]) {
-    send_packet(peer, connection, stream, encode_publish(topic, payload));
-}
-
-fn send_subscribe_packet(peer: &GamePeer, connection: &GameConnection, stream: &GameStream, client_id: u32, topic: &str) {
-    send_packet(peer, connection, stream, encode_subscribe(client_id, topic));
-}
-
-fn broadcast_entity_position(peer: &GamePeer, connection: &GameConnection, stream: &GameStream, shard_id: u32, client_id: u32, entity: &PlayerState) {
-    let mut payload = Vec::with_capacity(1 + 4 + 4 + 4);
-    payload.push(0x10);
-    payload.extend_from_slice(&client_id.to_le_bytes());
-    payload.extend_from_slice(&entity.position.x.to_le_bytes());
-    payload.extend_from_slice(&entity.position.y.to_le_bytes());
-    send_topic_payload(peer, connection, stream, &topic_name(shard_id), &payload);
-}
-
-fn parse_broadcast_payload(data: &[u8]) -> Option<&[u8]> {
-    if data.len() < 3 || data[0] != 0x04 {
-        return None;
-    }
-
-    let payload_len = u16::from_le_bytes([data[1], data[2]]) as usize;
-    if data.len() < 3 + payload_len {
-        return None;
-    }
-
-    Some(&data[3..3 + payload_len])
 }
 
 fn read_u32(input: &[u8], offset: usize) -> Option<u32> {
@@ -267,6 +270,13 @@ fn position_target_shard(position: Vec2, current_shard: u32) -> Option<u32> {
         Some(current_shard + 1)
     } else {
         None
+    }
+}
+fn moving_toward(velocity: Vec2, current_shard: u32, target_shard: u32) -> bool {
+    if target_shard > current_shard {
+        velocity.x > 0.0
+    } else {
+        velocity.x < 0.0
     }
 }
 
@@ -326,10 +336,8 @@ fn handle_handoff_request(
     entity.handoff_ticks = 0;
     entity.state_blob = state_blob;
 
-    if let (Some(conn), Some(stream)) = (&broker.connection, &broker.stream) {
-        let accept = encode_handoff_ack(0x21, entity_id);
-        send_topic_payload(&broker.peer, conn, stream, &topic_name(source_shard), &accept);
-    }
+    let accept = encode_handoff_ack(0x21, entity_id);
+    publish_gameplay(broker, &accept);
 }
 
 fn handle_handoff_accept(registry: &mut PlayerRegistry, entity_id: u32) {
@@ -360,14 +368,141 @@ fn handle_ghost_update(registry: &mut PlayerRegistry, entity_id: u32, position: 
     }
 }
 
-fn handle_handoff_complete(registry: &mut PlayerRegistry, entity_id: u32, position: Vec2, velocity: Vec2) {
+fn handle_handoff_complete(registry: &mut PlayerRegistry, entity_id: u32) {
+    
     if let Some(entity) = registry.players.get_mut(&entity_id) {
-        entity.position = position;
-        entity.velocity = velocity;
         entity.authority = AuthorityState::Owned;
         entity.handoff_target = None;
         entity.handoff_ticks = 0;
         entity.state_blob = build_state_blob(entity);
+    }
+}
+
+fn handle_crossing_alert(
+    broker: &BrokerConnection,
+    registry: &mut PlayerRegistry,
+    config: &ServerConfig,
+    entity_id: u32,
+    owning_shard: u32,
+    target_shard: u32,
+) {
+    if owning_shard != config.shard_id {
+        return;
+    }
+
+    let request = match registry.players.get_mut(&entity_id) {
+        Some(entity)
+            if entity.authority == AuthorityState::Owned
+                && moving_toward(entity.velocity, owning_shard, target_shard) =>
+        {
+            entity.authority = AuthorityState::PendingHandoff;
+            entity.handoff_target = Some(target_shard);
+            entity.handoff_ticks = 0;
+            entity.state_blob = build_state_blob(entity);
+            encode_handoff_request(entity_id, entity)
+        }
+        _ => return,
+    };
+
+    publish_gameplay(broker, &request);
+}
+
+fn handle_control_message(broker: &mut BrokerConnection, data: &Bytes) {
+    if data.is_empty() {
+        return;
+    }
+
+    if let Some(AnyMessage::PubSub(pubsub)) = decode_msg(data) {
+        match pubsub.op {
+            PubSubOp::ForcedPub => {
+                println!("Broker forced publish of a topic.");
+                send_control(broker, PubSubOp::Pub, pubsub.topic);
+            }
+            PubSubOp::ForcedSub => {
+                println!("Broker forced subscription to a topic.");
+                send_control(broker, PubSubOp::Sub, pubsub.topic);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    let text = String::from_utf8_lossy(data);
+    if text.trim_start().starts_with("WELCOME") {
+        println!("Broker welcomed the shard.");
+        broker.welcomed = true;
+    }
+}
+
+fn handle_gameplay_message(
+    broker: &BrokerConnection,
+    registry: &mut PlayerRegistry,
+    config: &ServerConfig,
+    data: &Bytes,
+) {
+    if data.is_empty() {
+        return;
+    }
+
+    match data[0] {
+        0x05 => {
+            if data.len() >= 5 {
+                let client_id = u32::from_le_bytes(data[1..5].try_into().unwrap());
+
+                let player = ensure_player(registry, client_id, config.shard_id);
+                if data.len() >= 21 {
+                    let mut input = [0u8; 16];
+                    input.copy_from_slice(&data[5..21]);
+                    apply_client_input(player, input, config.shard_id);
+                }
+
+                println!("Received input from client: {}", client_id);
+            }
+        }
+        0x20 => {
+            if let Some((entity_id, pos, vel, state_blob)) = decode_handoff_request(data) {
+                handle_handoff_request(broker, registry, config, entity_id, pos, vel, state_blob);
+            }
+        }
+        0x21 => {
+            if let Some(entity_id) = read_u32(data, 1) {
+                handle_handoff_accept(registry, entity_id);
+            }
+        }
+        0x22 => {
+            if let Some(entity_id) = read_u32(data, 1) {
+                handle_handoff_reject(registry, entity_id);
+            }
+        }
+        0x23 => {
+            if data.len() >= 1 + 4 + 16 {
+                if let Some(entity_id) = read_u32(data, 1) {
+                    let pos_x = read_f32(data, 5).unwrap_or(0.0);
+                    let pos_y = read_f32(data, 9).unwrap_or(0.0);
+                    let vel_x = read_f32(data, 13).unwrap_or(0.0);
+                    let vel_y = read_f32(data, 17).unwrap_or(0.0);
+                    handle_ghost_update(registry, entity_id, Vec2::new(pos_x, pos_y), Vec2::new(vel_x, vel_y));
+                }
+            }
+        }
+        0x24 => {
+            if let Some(entity_id) = read_u32(data, 1) {
+                handle_handoff_complete(registry, entity_id);
+            }
+        }
+        0x30 => {
+            if let (Some(entity_id), Some(owning), Some(target)) =
+                (read_u32(data, 1), read_u32(data, 5), read_u32(data, 9))
+            {
+                handle_crossing_alert(broker, registry, config, entity_id, owning, target);
+            }
+        }
+        0x10 => {
+            // Eh
+        }
+        tag => {
+            println!("Received unknown gameplay tag: {}", tag);
+        }
     }
 }
 
@@ -381,79 +516,32 @@ fn poll_broker(
             GameNetworkEvent::Connected(conn) => {
                 println!("Connected to Broker! Connection ID: {:?}", conn.connection_id);
                 broker.connection = Some(conn);
+                let _ = broker.peer.create_stream(conn, GameStreamReliability::Reliable);
                 let _ = broker.peer.create_stream(conn, GameStreamReliability::Unreliable);
             }
             GameNetworkEvent::StreamCreated(_conn, stream) => {
-                println!("Broker stream created.");
-                broker.stream = Some(stream);
-                if let (Some(conn), Some(stream)) = (&broker.connection, &broker.stream) {
-                    send_subscribe_packet(&broker.peer, conn, stream, config.shard_id, &topic_name(config.shard_id));
+                if stream.is_reliable() {
+                    println!("Broker lifeline (reliable) stream ready.");
+                    broker.reliable_stream = Some(stream);
+                } else {
+                    println!("Broker gameplay (unreliable) stream ready.");
+                    broker.unreliable_stream = Some(stream);
                 }
             }
             GameNetworkEvent::Disconnected(_) => {
                 println!("Lost connection to Broker.");
                 broker.connection = None;
-                broker.stream = None;
+                broker.reliable_stream = None;
+                broker.unreliable_stream = None;
+                broker.joined = false;
+                broker.welcomed = false;
+                broker.registered = false;
             }
-            GameNetworkEvent::Message { data, .. } => {
-                if data.is_empty() { continue; }
-                let tag = data[0];
-
-                match tag {
-                    0x05 => {
-                        if data.len() >= 5 {
-                            let client_id = u32::from_le_bytes(data[1..5].try_into().unwrap());
-
-                            let player = ensure_player(&mut registry, client_id, config.shard_id);
-                            if data.len() >= 21 {
-                                let mut input = [0u8; 16];
-                                input.copy_from_slice(&data[5..21]);
-                                apply_client_input(player, input, config.shard_id);
-                            }
-
-                            println!("Received input from client: {}", client_id);
-                        }
-                    }
-                    0x20 => {
-                        if let Some((entity_id, pos, vel, state_blob)) = decode_handoff_request(&data) {
-                            handle_handoff_request(&broker, &mut registry, &config, entity_id, pos, vel, state_blob);
-                        }
-                    }
-                    0x21 => {
-                        if let Some(entity_id) = read_u32(&data, 1) {
-                            handle_handoff_accept(&mut registry, entity_id);
-                        }
-                    }
-                    0x22 => {
-                        if let Some(entity_id) = read_u32(&data, 1) {
-                            handle_handoff_reject(&mut registry, entity_id);
-                        }
-                    }
-                    0x23 => {
-                        if data.len() >= 1 + 4 + 16 {
-                            if let Some(entity_id) = read_u32(&data, 1) {
-                                let pos_x = read_f32(&data, 5).unwrap_or(0.0);
-                                let pos_y = read_f32(&data, 9).unwrap_or(0.0);
-                                let vel_x = read_f32(&data, 13).unwrap_or(0.0);
-                                let vel_y = read_f32(&data, 17).unwrap_or(0.0);
-                                handle_ghost_update(&mut registry, entity_id, Vec2::new(pos_x, pos_y), Vec2::new(vel_x, vel_y));
-                            }
-                        }
-                    }
-                    0x24 => {
-                        if data.len() >= 1 + 4 + 16 {
-                            if let Some(entity_id) = read_u32(&data, 1) {
-                                let pos_x = read_f32(&data, 5).unwrap_or(0.0);
-                                let pos_y = read_f32(&data, 9).unwrap_or(0.0);
-                                let vel_x = read_f32(&data, 13).unwrap_or(0.0);
-                                let vel_y = read_f32(&data, 17).unwrap_or(0.0);
-                                handle_handoff_complete(&mut registry, entity_id, Vec2::new(pos_x, pos_y), Vec2::new(vel_x, vel_y));
-                            }
-                        }
-                    }
-                    _ => {
-                        println!("Received unknown tag from broker: {}", tag);
-                    }
+            GameNetworkEvent::Message { stream, data, .. } => {
+                if stream.is_reliable() {
+                    handle_control_message(&mut broker, &data);
+                } else {
+                    handle_gameplay_message(&broker, &mut registry, &config, &data);
                 }
             }
             GameNetworkEvent::Error { inner, .. } => {
@@ -464,87 +552,108 @@ fn poll_broker(
     }
 }
 
+fn drive_broker_session(mut broker: ResMut<BrokerConnection>, config: Res<ServerConfig>) {
+    if !broker.joined {
+        if let (Some(conn), Some(reliable)) = (&broker.connection, &broker.reliable_stream) {
+            let join = format!("JOIN shard {}", config.shard_id);
+            let _ = broker.peer.send(conn, reliable, Bytes::from(join));
+            broker.joined = true;
+            println!("Sent JOIN to broker as shard {}.", config.shard_id);
+        }
+    }
+
+    if broker.joined && broker.welcomed && !broker.registered && broker.unreliable_stream.is_some() {
+        send_control(&broker, PubSubOp::Pub, Topic::Snapshot(config.shard_id));
+
+        if config.shard_id > 0 {
+            send_control(&broker, PubSubOp::Sub, Topic::Snapshot(config.shard_id - 1));
+        }
+        send_control(&broker, PubSubOp::Sub, Topic::Snapshot(config.shard_id + 1));
+
+        send_control(&broker, PubSubOp::Sub, Topic::View(0));
+
+        broker.registered = true;
+        println!("Registered pub/sub with broker.");
+    }
+}
+
 fn simulate_and_publish(
     broker: Res<BrokerConnection>,
     mut registry: ResMut<PlayerRegistry>,
     config: Res<ServerConfig>,
 ) {
-    if let (Some(conn), Some(stream)) = (&broker.connection, &broker.stream) {
-        let player_ids: Vec<u32> = registry.players.keys().copied().collect();
-        for client_id in player_ids {
-            if let Some(player_state) = registry.players.get_mut(&client_id) {
-                let (left, right) = shard_bounds(config.shard_id);
+    if broker.connection.is_none() || broker.unreliable_stream.is_none() || !broker.registered {
+        return;
+    }
 
-                match player_state.authority {
-                    AuthorityState::Owned => {
-                        player_state.position += player_state.velocity;
+    let player_ids: Vec<u32> = registry.players.keys().copied().collect();
+    for client_id in player_ids {
+        if let Some(player_state) = registry.players.get_mut(&client_id) {
+            let (left, right) = shard_bounds(config.shard_id);
 
-                        if player_state.position.x < left {
-                            player_state.position.x = left;
-                            player_state.velocity.x = player_state.velocity.x.abs();
-                        }
+            match player_state.authority {
+                AuthorityState::Owned => {
+                    player_state.position += player_state.velocity;
 
-                        if player_state.position.x > right {
-                            player_state.position.x = right;
-                            player_state.velocity.x = -player_state.velocity.x.abs();
-                        }
+                    if player_state.position.x < left {
+                        player_state.position.x = left;
+                        player_state.velocity.x = player_state.velocity.x.abs();
+                    }
 
-                        if let Some(target) = position_target_shard(player_state.position, config.shard_id) {
+                    if player_state.position.x > right {
+                        player_state.position.x = right;
+                        player_state.velocity.x = -player_state.velocity.x.abs();
+                    }
+
+                    if let Some(target) = position_target_shard(player_state.position, config.shard_id) {
+                        if moving_toward(player_state.velocity, config.shard_id, target) {
                             player_state.authority = AuthorityState::PendingHandoff;
                             player_state.handoff_target = Some(target);
                             player_state.handoff_ticks = 0;
                             player_state.state_blob = build_state_blob(player_state);
 
-                            if let Some((conn, stream)) = (&broker.connection, &broker.stream) {
-                                let request = encode_handoff_request(client_id, player_state);
-                                send_topic_payload(&broker.peer, conn, stream, &topic_name(target), &request);
-                            }
+                            let request = encode_handoff_request(client_id, player_state);
+                            publish_gameplay(&broker, &request);
                         }
                     }
-                    AuthorityState::PendingHandoff => {
-                        player_state.position += player_state.velocity;
-                        player_state.handoff_ticks = player_state.handoff_ticks.saturating_add(1);
-                        player_state.state_blob = build_state_blob(player_state);
+                }
+                AuthorityState::PendingHandoff => {
+                    player_state.position += player_state.velocity;
+                    player_state.handoff_ticks = player_state.handoff_ticks.saturating_add(1);
+                    player_state.state_blob = build_state_blob(player_state);
 
-                        if let Some(target) = player_state.handoff_target {
-                            if let Some((conn, stream)) = (&broker.connection, &broker.stream) {
-                                let ghost = encode_ghost_update(client_id, player_state);
-                                send_topic_payload(&broker.peer, conn, stream, &topic_name(target), &ghost);
-                            }
+                    if let Some(target) = player_state.handoff_target {
+                        let ghost = encode_ghost_update(client_id, player_state);
+                        publish_gameplay(&broker, &ghost);
 
-                            if (target > config.shard_id && player_state.position.x >= right - 2.0)
-                                || (target < config.shard_id && player_state.position.x <= left + 2.0)
-                            {
-                                if let Some((conn, stream)) = (&broker.connection, &broker.stream) {
-                                    let complete = encode_handoff_complete(client_id);
-                                    send_topic_payload(&broker.peer, conn, stream, &topic_name(target), &complete);
-                                }
+                        if (target > config.shard_id && player_state.position.x >= right - 2.0)
+                            || (target < config.shard_id && player_state.position.x <= left + 2.0)
+                        {
+                            let complete = encode_handoff_complete(client_id);
+                            publish_gameplay(&broker, &complete);
 
-                                player_state.authority = AuthorityState::Ghost;
-                                player_state.handoff_ticks = 0;
-                            }
+                            player_state.authority = AuthorityState::Ghost;
+                            player_state.handoff_ticks = 0;
+                        }
 
-                            if player_state.handoff_ticks > 30 {
-                                if let Some((conn, stream)) = (&broker.connection, &broker.stream) {
-                                    let reject = encode_handoff_ack(0x22, client_id);
-                                    send_topic_payload(&broker.peer, conn, stream, &topic_name(target), &reject);
-                                }
+                        if player_state.handoff_ticks > 30 {
+                            let reject = encode_handoff_ack(0x22, client_id);
+                            publish_gameplay(&broker, &reject);
 
-                                player_state.authority = AuthorityState::Owned;
-                                player_state.handoff_target = None;
-                                player_state.handoff_ticks = 0;
-                                player_state.velocity.x = -player_state.velocity.x;
-                            }
+                            player_state.authority = AuthorityState::Owned;
+                            player_state.handoff_target = None;
+                            player_state.handoff_ticks = 0;
+                            player_state.velocity.x = -player_state.velocity.x;
                         }
                     }
-                    AuthorityState::Ghost => {
-                        player_state.state_blob = build_state_blob(player_state);
-                    }
                 }
+                AuthorityState::Ghost => {
+                    player_state.state_blob = build_state_blob(player_state);
+                }
+            }
 
-                if let (Some(conn), Some(stream)) = (&broker.connection, &broker.stream) {
-                    broadcast_entity_position(&broker.peer, conn, stream, config.shard_id, client_id, player_state);
-                }
+            if player_state.authority != AuthorityState::Ghost {
+                publish_entity_position(&broker, client_id, player_state);
             }
         }
     }

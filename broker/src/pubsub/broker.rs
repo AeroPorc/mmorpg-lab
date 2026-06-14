@@ -105,7 +105,7 @@ impl Broker {
         */
     }
 
-    pub fn create_topic( // create a new topic delivered by given connection as service
+    pub fn create_topic(
         &mut self,
         topic: Topic,
         connection: GameConnection,
@@ -121,7 +121,7 @@ impl Broker {
         }
     }
 
-    pub fn forced_create_topic( // notify the service to create the given topic
+    pub fn forced_create_topic( 
         &mut self,
         topic: &Topic,
         connection: &GameConnection,
@@ -145,7 +145,7 @@ impl Broker {
     }
     
 
-    pub fn suppress_topic( // suppress a topic delivered by given connection as service
+    pub fn suppress_topic(
         &mut self,
         topic: Topic,
         connection: GameConnection,
@@ -191,7 +191,7 @@ impl Broker {
         }
     }
     
-    pub fn subscribe( // subscribe given subscriber to a preexisting topic
+    pub fn subscribe( 
         &mut self,
         topic: Topic,
         connection: GameConnection,
@@ -213,7 +213,7 @@ impl Broker {
         }
     }
 
-    pub fn forced_subscribe( // notify the service to sub to given topic
+    pub fn forced_subscribe( 
         &mut self,
         topic: &Topic,
         connection: &GameConnection,
@@ -229,7 +229,7 @@ impl Broker {
         }
     }
 
-    pub fn unsubscribe( // unsubscribe given subscriber to a presubscribed topic
+    pub fn unsubscribe( 
         &mut self,
         topic: Topic,
         connection: GameConnection,
@@ -248,8 +248,6 @@ impl Broker {
                 stream,
             });
         }
-
-        // Notify the service of the unsub
         if let Some(service) = self.services.0.remove(&connection) {
             let stop_sub_msg = PubSubMessage {
                 op: PubSubOp::StopSub,
@@ -261,7 +259,7 @@ impl Broker {
         }
     }
 
-    pub fn publish( // publish the newly received data to all subscribers of the topic corresponding to (connection, stream)
+    pub fn publish( 
         &mut self,
         connection: &GameConnection,
         stream: &GameStream,

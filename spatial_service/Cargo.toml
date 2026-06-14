@@ -1,0 +1,10 @@
+[package]
+name = "spatial_service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+game_sockets.workspace = true
+bevy.workspace = true
+bytes.workspace = true
+shared.workspace = true
