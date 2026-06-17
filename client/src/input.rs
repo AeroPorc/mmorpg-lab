@@ -1,55 +1,45 @@
 use bevy::prelude::*;
-
-use shared::messages::netmessage::{send_msg, Input, InputMessage};
+use bytes::Bytes;
 
 use crate::AppState;
-use crate::NetworkClient;
-
-#[derive(Resource, Default)]
-pub struct InputMessageResource(pub InputMessage);
+use crate::network::{LocalPlayer, NetworkClient};
 
 pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<InputMessageResource>()
-            .add_systems(Update, (handle_inputs).run_if(in_state(AppState::InGame)));
+        app.add_systems(Update, send_input.run_if(in_state(AppState::InGame)));
     }
 }
 
-fn handle_inputs(
+fn axis_to_byte(axis: f32) -> u8 {
+    (((axis + 1.0) * 0.5) * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn send_input(
     keyboard: Res<ButtonInput<KeyCode>>,
-    mut input_msg: ResMut<InputMessageResource>,
-    client: ResMut<NetworkClient>,
+    client: Res<NetworkClient>,
+    local: Res<LocalPlayer>,
 ) {
-    let input = Input {
-        up: keyboard.pressed(KeyCode::KeyW)
-            || keyboard.pressed(KeyCode::ArrowUp),
-
-        down: keyboard.pressed(KeyCode::KeyS)
-            || keyboard.pressed(KeyCode::ArrowDown),
-
-        left: keyboard.pressed(KeyCode::KeyA)
-            || keyboard.pressed(KeyCode::ArrowLeft),
-
-        right: keyboard.pressed(KeyCode::KeyD)
-            || keyboard.pressed(KeyCode::ArrowRight),
-    };
-
-    input_msg.0.push(input);
-
-    let Some(connection) = client.connection.as_ref() else {
+    let (Some(connection), Some(stream)) = (&client.connection, &client.unreliable_stream) else {
         return;
     };
 
-    let Some(stream) = client.unreliable_stream.as_ref() else {
-        return;
-    };
+    let right = keyboard.pressed(KeyCode::KeyD) || keyboard.pressed(KeyCode::ArrowRight);
+    let left = keyboard.pressed(KeyCode::KeyA) || keyboard.pressed(KeyCode::ArrowLeft);
+    let up = keyboard.pressed(KeyCode::KeyW) || keyboard.pressed(KeyCode::ArrowUp);
+    let down = keyboard.pressed(KeyCode::KeyS) || keyboard.pressed(KeyCode::ArrowDown);
 
-    // Désormais factorisé dans la fonction send_msg de la shared library
-    //let mut serializer = Serializer::new();
-    //input_msg.0.serialize(&mut serializer);
-    //let _ = client.peer.send(connection, stream, serializer.buffer.into());
+    let x = right as i32 as f32 - left as i32 as f32;
+    let y = up as i32 as f32 - down as i32 as f32;
 
-    let _ = send_msg(&client.peer, &connection, &stream, &input_msg.0);
+    let mut payload = Vec::with_capacity(1 + 4 + 16);
+    payload.push(0x05);
+    payload.extend_from_slice(&local.id.to_le_bytes());
+    let mut input = [127u8; 16];
+    input[0] = axis_to_byte(x);
+    input[1] = axis_to_byte(y);
+    payload.extend_from_slice(&input);
+
+    let _ = client.peer.send(connection, stream, Bytes::from(payload));
 }
