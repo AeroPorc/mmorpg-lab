@@ -1,4 +1,5 @@
 pub mod messages;
+pub mod spatial;
 
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +37,7 @@ impl ServerInfo {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LoginRequest {
     pub username: String,
-    pub password: String, // useless, must be "1234" to enable connection to the Gatekeeper
+    pub password: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -1,6 +1,8 @@
 use shared::*;
-use shared::messages::netmessage::{send_msg, decode_msg, AnyMessage, PubSubMessage, PubSubOp};
+use shared::messages::netmessage::{decode_msg, send_msg, AnyMessage, PubSubMessage, PubSubOp};
+use shared::messages::topics::Topic;
 use bevy::prelude::*;
+use std::collections::HashMap;
 
 use game_sockets::protocols::UdpBackend;
 use game_sockets::{GamePeer, GameNetworkEvent, GameConnection, GameStream, GameStreamReliability};
@@ -10,19 +12,32 @@ use crate::AppState;
 #[derive(Resource)]
 pub struct GameServerInfo(pub ServerInfo);
 
+#[derive(Resource, Default)]
+pub struct LocalPlayer {
+    pub id: u32,
+}
+
+#[derive(Resource, Default)]
+pub struct WorldView {
+    pub players: HashMap<u32, Vec2>,
+    pub enemies: HashMap<u32, Vec2>,
+}
+
+#[derive(Resource, Default)]
+pub struct PlayerStats {
+    pub hp: i32,
+    pub score: u32,
+    pub wave: u32,
+}
+
 #[derive(Resource)]
 pub struct NetworkClient {
-    //pub player_id,
     pub peer: GamePeer,
     pub connection: Option<GameConnection>,
     pub reliable_stream: Option<GameStream>,
     pub unreliable_stream: Option<GameStream>,
+    pub registered: bool,
 }
-
-/*
-#[derive(Event, Debug)]
-pub struct NetworkMessageEvent(pub GameNetworkEvent);
-*/
 
 pub struct NetworkPlugin;
 
@@ -30,139 +45,173 @@ impl Plugin for NetworkPlugin {
     fn build(&self, app: &mut App) {
         let peer = GamePeer::new(UdpBackend::new());
 
-        app.insert_resource(NetworkClient { 
-                peer, 
-                connection: None,
-                reliable_stream: None,
-                unreliable_stream : None,
-            })
-            //.add_event::<NetworkMessageEvent>()
-            .add_systems(OnEnter(AppState::Connecting), setup_connection)
-            .add_systems(Update, connection_request.run_if(in_state(AppState::Connecting)))
-            .add_systems(Update, network_poll);
-            //.add_systems(OnExit(AppState::InGame), disconnection_handler);
+        app.insert_resource(NetworkClient {
+            peer,
+            connection: None,
+            reliable_stream: None,
+            unreliable_stream: None,
+            registered: false,
+        })
+        .init_resource::<LocalPlayer>()
+        .init_resource::<WorldView>()
+        .init_resource::<PlayerStats>()
+        .add_systems(OnEnter(AppState::Connecting), setup_connection)
+        .add_systems(Update, connection_request.run_if(in_state(AppState::Connecting)))
+        .add_systems(Update, network_poll)
+        .add_systems(Update, register_pubsub.run_if(in_state(AppState::InGame)));
     }
 }
 
-// Initiate connection with game server
-fn setup_connection(client: ResMut<NetworkClient>,
-    game_server: ResMut<GameServerInfo>
-) {
+fn setup_connection(client: ResMut<NetworkClient>, game_server: Res<GameServerInfo>) {
     if let Err(e) = client.peer.connect(&game_server.0.ip, game_server.0.port) {
         error!("Connection failed: {:?}", e);
     } else {
-        println!("Connecting to game server...");
+        println!("Connecting to broker {}:{}...", game_server.0.ip, game_server.0.port);
     }
 }
 
-pub fn connection_request(
-    client: ResMut<NetworkClient>,
-) {
-    match &client.connection {
-        Some(connection) => {
-            match &client.reliable_stream {
-                Some(stream) => {
-                    let _ = client.peer.send(&connection, &stream, "JOIN Caillou".into());
-                }
-                None => {}
-            }
-        }
-        None => {}
+fn connection_request(client: ResMut<NetworkClient>) {
+    if let (Some(connection), Some(stream)) = (&client.connection, &client.reliable_stream) {
+        let _ = client.peer.send(connection, stream, "JOIN player".into());
     }
+}
+
+
+fn register_pubsub(mut client: ResMut<NetworkClient>) {
+    if client.registered || client.unreliable_stream.is_none() {
+        return;
+    }
+
+    let ok = if let (Some(connection), Some(reliable)) =
+        (&client.connection, &client.reliable_stream)
+    {
+        let stream = client.unreliable_stream.clone();
+        let pub_msg = PubSubMessage {
+            op: PubSubOp::Pub,
+            topic: Topic::Input(0),
+            stream: stream.clone(),
+        };
+        let _ = send_msg(&client.peer, connection, reliable, &pub_msg);
+
+        let sub_msg = PubSubMessage {
+            op: PubSubOp::Sub,
+            topic: Topic::Snapshot(0),
+            stream,
+        };
+        let _ = send_msg(&client.peer, connection, reliable, &sub_msg);
+        true
+    } else {
+        false
+    };
+
+    if ok {
+        client.registered = true;
+        println!("Registered with broker: publishing Input(0), subscribed to Snapshot(0).");
+    }
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_f32(data: &[u8], offset: usize) -> Option<f32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(f32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_i32(data: &[u8], offset: usize) -> Option<i32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(i32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 pub fn network_poll(
     mut client: ResMut<NetworkClient>,
+    mut world: ResMut<WorldView>,
+    mut stats: ResMut<PlayerStats>,
+    local: Res<LocalPlayer>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
     while let Ok(Some(event)) = client.peer.poll() {
         match event {
             GameNetworkEvent::Connected(connection) => {
-                println!("Connected to server: {:?}", connection);
+                println!("Connected to server: {:?}", connection.connection_id);
                 client.connection = Some(connection);
                 let _ = client.peer.create_stream(connection, GameStreamReliability::Reliable);
                 let _ = client.peer.create_stream(connection, GameStreamReliability::Unreliable);
             }
-            GameNetworkEvent::Disconnected(connection) => {
-                println!("Disconnected from server: {:?}", connection);
-                
+            GameNetworkEvent::Disconnected(_) => {
+                println!("Disconnected from server.");
                 client.connection = None;
                 client.reliable_stream = None;
                 client.unreliable_stream = None;
-
+                client.registered = false;
+                world.players.clear();
+                world.enemies.clear();
                 next_state.set(AppState::Disconnected);
             }
-            GameNetworkEvent::Message { connection, stream, data } => {
-                println!("MSG = {:?}", data);
-
-                if stream.is_reliable() {
-                    if let Some(AnyMessage::PubSub(pubsub_msg)) = decode_msg(&data) {
-                        match pubsub_msg.op {
-                            PubSubOp::ForcedPub => { // if asked to pub a topic
-                                let pub_msg = PubSubMessage {
-                                    op: PubSubOp::Pub,
-                                    topic: pubsub_msg.topic,
-                                    stream: client.unreliable_stream.clone(),
-                                };
-
-                                let _ = send_msg(&client.peer, &connection, &stream, &pub_msg);
-                            }
-                            PubSubOp::ForcedSub => { // if asked to sub to a topic
-                                let sub_msg = PubSubMessage {
-                                    op: PubSubOp::Sub,
-                                    topic: pubsub_msg.topic,
-                                    stream: client.unreliable_stream.clone(),
-                                };
-
-                                let _ = send_msg(&client.peer, &connection, &stream, &sub_msg);
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    let msg = String::from_utf8_lossy(&data);
-                    let msg = msg.trim();
-
-                    if msg.starts_with("WELCOME ") { // Welcomed by the dedicated server -> officially connected
-                        //let username = msg.replace("WELCOME ", "").trim().to_string();
-                        next_state.set(AppState::InGame);
-                    }
-                    if msg.starts_with("REJECT ") { // Rejected by the dedicated server -> server is full, must try another server
-                        next_state.set(AppState::Rejected);
-                    }
-                } else {
-                    println!("GameplayMessgage !");
-                }
-            }
-            GameNetworkEvent::Error { connection: _connection, inner } => {
-                eprintln!("Error from server: {:?}", inner);
-            }
             GameNetworkEvent::StreamCreated(_connection, stream) => {
-                eprintln!("Stream created : {:?}", stream);
                 if stream.is_reliable() {
                     client.reliable_stream = Some(stream);
                 } else {
-                    client.unreliable_stream = Some(stream); // Stream used to publish inputs for now (can be extended for other streams later on if needed)
+                    client.unreliable_stream = Some(stream);
                 }
             }
-            GameNetworkEvent::StreamClosed(_, _) => {
+            GameNetworkEvent::Message { stream, data, .. } => {
+                if stream.is_reliable() {
+                    if let Some(AnyMessage::PubSub(_)) = decode_msg(&data) {
+                    } else {
+                        let text = String::from_utf8_lossy(&data);
+                        if text.trim_start().starts_with("WELCOME") {
+                            println!("Welcomed by broker; entering game.");
+                            next_state.set(AppState::InGame);
+                        } else if text.trim_start().starts_with("REJECT") {
+                            next_state.set(AppState::Rejected);
+                        }
+                    }
+                } else if !data.is_empty() {
+                    match data[0] {
+                        0x10 => {
+                            if let (Some(id), Some(x), Some(y)) =
+                                (read_u32(&data, 1), read_f32(&data, 5), read_f32(&data, 9))
+                            {
+                                world.players.insert(id, Vec2::new(x, y));
+                            }
+                        }
+                        0x40 => {
+                            if let (Some(id), Some(x), Some(y)) =
+                                (read_u32(&data, 1), read_f32(&data, 5), read_f32(&data, 9))
+                            {
+                                world.enemies.insert(id, Vec2::new(x, y));
+                            }
+                        }
+                        0x41 => {
+                            if let Some(id) = read_u32(&data, 1) {
+                                world.enemies.remove(&id);
+                            }
+                        }
+                        0x11 => {
+                            if let (Some(id), Some(hp), Some(score), Some(wave)) = (
+                                read_u32(&data, 1),
+                                read_i32(&data, 5),
+                                read_u32(&data, 9),
+                                read_u32(&data, 13),
+                            ) {
+                                if id == local.id {
+                                    stats.hp = hp;
+                                    stats.score = score;
+                                    stats.wave = wave;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
+            GameNetworkEvent::Error { inner, .. } => {
+                eprintln!("Error from server: {:?}", inner);
+            }
+            GameNetworkEvent::StreamClosed(_, _) => {}
         }
     }
 }
-
-/*
-fn disconnection_handler(
-    mut client: ResMut<NetworkClient>,
-    mut next_state: ResMut<NextState<AppState>>,
-) {
-    println!("Disconnecting from game server...");
-
-    // 1. fermer proprement le peer (envoie Shutdown + join thread)
-    if let Err(e) = client.peer.shutdown() {
-        eprintln!("Error during shutdown: {:?}", e);
-    }
-
-    next_state.set(AppState::Disconnected);
-}
-*/

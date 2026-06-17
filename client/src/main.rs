@@ -13,12 +13,16 @@ use crate::network::*;
 mod input;
 use crate::input::*;
 
+mod render;
+use crate::render::*;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(GatekeeperLoginPlugin)
         .add_plugins(NetworkPlugin)
         .add_plugins(InputPlugin)
+        .add_plugins(RenderPlugin)
         .init_state::<AppState>()
         .insert_resource(GatekeeperInfo { 
             0: ServerInfo {
@@ -28,7 +32,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         })
         .insert_state(AppState::Login)
-        //.add_systems(Update, handle_network)
         .run();
 
     Ok(())

@@ -3,9 +3,18 @@ use bevy::prelude::*;
 
 use crate::AppState;
 use crate::GameServerInfo;
+use crate::network::LocalPlayer;
 
-// A simple plugin that handle the login to the gatekeeper
-// Override GameServerInfo's ressource for the initialisation of the network plugin (indicate ip and port to connect to)
+fn player_id_to_u32(s: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in s.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+
 
 #[derive(Resource, Clone)]
 pub struct GatekeeperInfo(pub ServerInfo);
@@ -75,7 +84,9 @@ fn start_login(
             response.server.ip, response.server.port, response.server.zone
         );
 
-        // Login done, initiate the connection to the game server
+        commands.insert_resource(LocalPlayer {
+            id: player_id_to_u32(&response.player_id),
+        });
         commands.insert_resource(
             GameServerInfo(response.server)
         );
@@ -86,6 +97,7 @@ fn start_login(
 
 fn reattempt_login(
     gatekeeper: ResMut<GatekeeperInfo>,
+    mut commands: Commands,
     mut next_state: ResMut<NextState<AppState>>,
     mut game_server: ResMut<GameServerInfo>,
 ) {
@@ -117,6 +129,9 @@ fn reattempt_login(
             response.server.ip, response.server.port, response.server.zone
         );
 
+        commands.insert_resource(LocalPlayer {
+            id: player_id_to_u32(&response.player_id),
+        });
         *game_server = GameServerInfo(response.server);
 
         next_state.set(AppState::Connecting);

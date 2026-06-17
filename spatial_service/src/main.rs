@@ -16,7 +16,7 @@ use quadtree::{QuadTree, Rect};
 const SHARD_WIDTH: f32 = 256.0;
 const WORLD_HEIGHT: f32 = 256.0;
 const HANDOFF_MARGIN: f32 = 24.0;
-const QUADTREE_MAX_DEPTH: u8 = 4;
+const QUADTREE_MAX_DEPTH: u8 = 2;
 
 const CONTROL_TOPIC: Topic = Topic::View(0);
 

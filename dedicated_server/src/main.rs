@@ -5,6 +5,7 @@ use game_sockets::protocols::UdpBackend;
 use game_sockets::{GameConnection, GameNetworkEvent, GamePeer, GameStream, GameStreamReliability};
 use shared::messages::netmessage::{decode_msg, send_msg, AnyMessage, PubSubMessage, PubSubOp};
 use shared::messages::topics::Topic;
+use shared::spatial::{QuadTree, Rect};
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
@@ -13,15 +14,45 @@ use uuid::Uuid;
 
 const TICK_HZ: f64 = 20.0;
 
-const SHARD_WIDTH: f32 = 256.0;
+// Arena defaults (overridable via env: ARENA_WIDTH / ARENA_HEIGHT / QUAD_DEPTH).
+const DEFAULT_SHARD_WIDTH: f32 = 256.0;
+const DEFAULT_WORLD_HEIGHT: f32 = 256.0;
+const DEFAULT_QUAD_DEPTH: u8 = 2;
+
 const HANDOFF_MARGIN: f32 = 24.0;
-const ENTITY_SPEED: f32 = 12.0;
+const DUMMY_SPEED: f32 = 1.0;
+const PLAYER_SPEED: f32 = 6.0;
 const STATE_BYTES: usize = 64;
+
+// Enemy AI tuning.
+const ENEMY_SPEED: f32 = 6.0;
+const SPAWN_INTERVAL_TICKS: u32 = 20;
+const SPAWN_BATCH: usize = 8;
+const MAX_ENEMIES: usize = 200;
+// Enemies spawn on a ring this far from the player (clamped to its leaf cell).
+const ENEMY_SPAWN_RADIUS: f32 = 280.0;
+
+// Combat tuning.
+const PLAYER_MAX_HP: i32 = 100;
+const ENEMY_BASE_HP: i32 = 3;
+const ENEMY_CONTACT_DAMAGE: i32 = 6;
+const CONTACT_RANGE: f32 = 16.0;
+const PLAYER_DAMAGE_COOLDOWN: u8 = 12; // i-frames (~0.6s)
+const ATTACK_COOLDOWN: u8 = 6; // auto-attack every ~0.3s
+const ATTACK_RANGE: f32 = 130.0;
+const ATTACK_DAMAGE: i32 = 1;
+
+// Waves: difficulty steps up every interval.
+const WAVE_INTERVAL_TICKS: u32 = 300; // ~15s
 
 #[derive(Resource)]
 pub struct ServerConfig {
     pub id: String,
     pub shard_id: u32,
+    pub shard_count: u32,
+    pub shard_width: f32,
+    pub world_height: f32,
+    pub quad_depth: u8,
     pub broker_addr: SocketAddr,
 }
 
@@ -30,6 +61,10 @@ impl ServerConfig {
         Self {
             id: Uuid::new_v4().to_string(),
             shard_id: env::var("SHARD_ID").unwrap_or_else(|_| "0".to_string()).parse().unwrap(),
+            shard_count: env::var("SHARD_COUNT").unwrap_or_else(|_| "4".to_string()).parse().unwrap_or(4),
+            shard_width: env::var("ARENA_WIDTH").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SHARD_WIDTH),
+            world_height: env::var("ARENA_HEIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_WORLD_HEIGHT),
+            quad_depth: env::var("QUAD_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_QUAD_DEPTH),
             broker_addr: env::var("BROKER_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:7002".to_string())
                 .parse()
@@ -53,11 +88,98 @@ pub struct PlayerState {
     pub handoff_target: Option<u32>,
     pub handoff_ticks: u8,
     pub state_blob: [u8; STATE_BYTES],
+    pub bounce: bool,
+    pub hp: i32,
+    pub score: u32,
+    pub attack_cd: u8,
+    pub damage_cd: u8,
+}
+
+impl PlayerState {
+    fn fresh(position: Vec2, velocity: Vec2, bounce: bool) -> Self {
+        Self {
+            position,
+            velocity,
+            authority: AuthorityState::Owned,
+            handoff_target: None,
+            handoff_ticks: 0,
+            state_blob: [0u8; STATE_BYTES],
+            bounce,
+            hp: PLAYER_MAX_HP,
+            score: 0,
+            attack_cd: 0,
+            damage_cd: 0,
+        }
+    }
 }
 
 #[derive(Resource, Default)]
 pub struct PlayerRegistry {
     pub players: HashMap<u32, PlayerState>,
+}
+
+pub struct Enemy {
+    pub position: Vec2,
+    pub velocity: Vec2,
+    pub target: Option<u32>,
+    pub hp: i32,
+}
+
+/// Wave / difficulty progression.
+#[derive(Resource, Default)]
+pub struct GameState {
+    pub wave: u32,
+    pub wave_clock: u32,
+}
+
+#[derive(Resource)]
+pub struct EnemyRegistry {
+    pub enemies: HashMap<u32, Enemy>,
+    pub next_id: u32,
+    pub spawn_clock: u32,
+    pub rng: u32,
+}
+
+impl Default for EnemyRegistry {
+    fn default() -> Self {
+        Self {
+            enemies: HashMap::new(),
+            next_id: 1,
+            spawn_clock: 0,
+            rng: 0x9E37_79B9,
+        }
+    }
+}
+
+
+#[derive(Resource)]
+pub struct ShardWorld {
+    pub tree: QuadTree,
+}
+
+impl ShardWorld {
+    fn new(config: &ServerConfig) -> Self {
+        let bounds = Rect::new(
+            Vec2::ZERO,
+            Vec2::new(config.shard_width * config.shard_count as f32, config.world_height),
+        );
+        Self {
+            tree: QuadTree::build(bounds, config.quad_depth, config.shard_width),
+        }
+    }
+}
+
+fn next_rand(state: &mut u32) -> u32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    x
+}
+
+fn rand_unit(state: &mut u32) -> f32 {
+    next_rand(state) as f32 / u32::MAX as f32
 }
 
 #[derive(Resource)]
@@ -72,14 +194,32 @@ pub struct BrokerConnection {
 }
 
 fn main() {
+    let config = ServerConfig::from_env();
+    let world = ShardWorld::new(&config);
+
     App::new()
         .add_plugins(
             MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(1.0 / TICK_HZ))),
         )
-        .insert_resource(ServerConfig::from_env())
+        .insert_resource(config)
+        .insert_resource(world)
         .init_resource::<PlayerRegistry>()
+        .init_resource::<EnemyRegistry>()
+        .init_resource::<GameState>()
         .add_systems(Startup, (connect_to_broker, maybe_spawn_test_entity))
-        .add_systems(Update, (poll_broker, drive_broker_session, simulate_and_publish).chain())
+        .add_systems(
+            Update,
+            (
+                poll_broker,
+                drive_broker_session,
+                simulate_and_publish,
+                advance_waves,
+                spawn_enemies,
+                update_and_cull_enemies,
+                combat,
+            )
+                .chain(),
+        )
         .run();
 }
 
@@ -89,17 +229,10 @@ fn maybe_spawn_test_entity(mut registry: ResMut<PlayerRegistry>, config: Res<Ser
     }
 
     let client_id = 100 * config.shard_id + 1;
-    let position = default_spawn_position(config.shard_id, client_id);
+    let position = default_spawn_position(config.shard_id, client_id, config.shard_width);
     registry.players.insert(
         client_id,
-        PlayerState {
-            position,
-            velocity: Vec2::new(ENTITY_SPEED, 0.0), 
-            authority: AuthorityState::Owned,
-            handoff_target: None,
-            handoff_ticks: 0,
-            state_blob: [0u8; STATE_BYTES],
-        },
+        PlayerState::fresh(position, Vec2::new(DUMMY_SPEED, 0.0), true),
     );
     println!("Spawned test entity {} at {:?} (SPAWN_DUMMY).", client_id, position);
 }
@@ -151,6 +284,22 @@ fn publish_entity_position(broker: &BrokerConnection, client_id: u32, entity: &P
     payload.extend_from_slice(&client_id.to_le_bytes());
     payload.extend_from_slice(&entity.position.x.to_le_bytes());
     payload.extend_from_slice(&entity.position.y.to_le_bytes());
+    publish_gameplay(broker, &payload);
+}
+
+fn publish_enemy_update(broker: &BrokerConnection, enemy_id: u32, pos: Vec2) {
+    let mut payload = Vec::with_capacity(1 + 4 + 4 + 4);
+    payload.push(0x40);
+    payload.extend_from_slice(&enemy_id.to_le_bytes());
+    payload.extend_from_slice(&pos.x.to_le_bytes());
+    payload.extend_from_slice(&pos.y.to_le_bytes());
+    publish_gameplay(broker, &payload);
+}
+
+fn publish_enemy_despawn(broker: &BrokerConnection, enemy_id: u32) {
+    let mut payload = Vec::with_capacity(1 + 4);
+    payload.push(0x41);
+    payload.extend_from_slice(&enemy_id.to_le_bytes());
     publish_gameplay(broker, &payload);
 }
 
@@ -209,30 +358,25 @@ fn encode_handoff_complete(entity_id: u32) -> Vec<u8> {
 }
 
 
-fn shard_bounds(shard_id: u32) -> (f32, f32) {
-    let left = shard_id as f32 * SHARD_WIDTH;
-    (left, left + SHARD_WIDTH)
+fn shard_bounds(shard_id: u32, shard_width: f32) -> (f32, f32) {
+    let left = shard_id as f32 * shard_width;
+    (left, left + shard_width)
 }
 
-fn default_spawn_position(shard_id: u32, client_id: u32) -> Vec2 {
-    let (left, right) = shard_bounds(shard_id);
+fn default_spawn_position(shard_id: u32, client_id: u32, shard_width: f32) -> Vec2 {
+    let (left, right) = shard_bounds(shard_id, shard_width);
     let lane = (client_id % 6) as f32;
     Vec2::new(left + (right - left) * 0.5, 32.0 + lane * 18.0)
 }
 
-fn default_velocity(shard_id: u32, client_id: u32) -> Vec2 {
-    let direction = if (shard_id + client_id) % 2 == 0 { 1.0 } else { -1.0 };
-    Vec2::new(direction * ENTITY_SPEED, 0.0)
-}
-
-fn ensure_player(registry: &mut PlayerRegistry, client_id: u32, shard_id: u32) -> &mut PlayerState {
-    registry.players.entry(client_id).or_insert_with(|| PlayerState {
-        position: default_spawn_position(shard_id, client_id),
-        velocity: default_velocity(shard_id, client_id),
-        authority: AuthorityState::Owned,
-        handoff_target: None,
-        handoff_ticks: 0,
-        state_blob: [0u8; STATE_BYTES],
+fn ensure_player<'a>(
+    registry: &'a mut PlayerRegistry,
+    client_id: u32,
+    shard_id: u32,
+    shard_width: f32,
+) -> &'a mut PlayerState {
+    registry.players.entry(client_id).or_insert_with(|| {
+        PlayerState::fresh(default_spawn_position(shard_id, client_id, shard_width), Vec2::ZERO, false)
     })
 }
 
@@ -262,11 +406,11 @@ fn decode_handoff_request(payload: &[u8]) -> Option<(u32, Vec2, Vec2, [u8; STATE
     Some((entity_id, Vec2::new(pos_x, pos_y), Vec2::new(vel_x, vel_y), state_blob))
 }
 
-fn position_target_shard(position: Vec2, current_shard: u32) -> Option<u32> {
-    let (left, right) = shard_bounds(current_shard);
+fn position_target_shard(position: Vec2, current_shard: u32, shard_count: u32, shard_width: f32) -> Option<u32> {
+    let (left, right) = shard_bounds(current_shard, shard_width);
     if position.x <= left + HANDOFF_MARGIN && current_shard > 0 {
         Some(current_shard - 1)
-    } else if position.x >= right - HANDOFF_MARGIN {
+    } else if position.x >= right - HANDOFF_MARGIN && current_shard + 1 < shard_count {
         Some(current_shard + 1)
     } else {
         None
@@ -280,23 +424,15 @@ fn moving_toward(velocity: Vec2, current_shard: u32, target_shard: u32) -> bool 
     }
 }
 
-fn apply_client_input(entity: &mut PlayerState, input: [u8; 16], shard_id: u32) {
-    let mut x = (input[0] as f32 / 255.0) * 2.0 - 1.0;
-    let mut y = (input[1] as f32 / 255.0) * 2.0 - 1.0;
+fn apply_client_input(entity: &mut PlayerState, input: [u8; 16], _shard_id: u32) {
+    let x = (input[0] as f32 / 255.0) * 2.0 - 1.0;
+    let y = (input[1] as f32 / 255.0) * 2.0 - 1.0;
 
-    if x.abs() < 0.05 {
-        x = if shard_id % 2 == 0 { 1.0 } else { -1.0 };
-    }
-
-    if y.abs() < 0.05 {
-        y = 0.0;
-    }
-
-    let direction = Vec2::new(x, y).normalize_or_zero();
-    entity.velocity = if direction == Vec2::ZERO {
-        default_velocity(shard_id, 0)
+    let direction = Vec2::new(x, y);
+    entity.velocity = if direction.length() < 0.1 {
+        Vec2::ZERO 
     } else {
-        direction * ENTITY_SPEED
+        direction.normalize() * PLAYER_SPEED
     };
 
     entity.state_blob = build_state_blob(entity);
@@ -311,7 +447,7 @@ fn handle_handoff_request(
     velocity: Vec2,
     state_blob: [u8; STATE_BYTES],
 ) {
-    let (left, right) = shard_bounds(config.shard_id);
+    let (left, right) = shard_bounds(config.shard_id, config.shard_width);
     let source_shard = if position.x <= left + HANDOFF_MARGIN {
         config.shard_id.saturating_sub(1)
     } else if position.x >= right - HANDOFF_MARGIN {
@@ -320,14 +456,10 @@ fn handle_handoff_request(
         config.shard_id
     };
 
-    let entity = registry.players.entry(entity_id).or_insert(PlayerState {
-        position,
-        velocity,
-        authority: AuthorityState::Ghost,
-        handoff_target: Some(source_shard),
-        handoff_ticks: 0,
-        state_blob,
-    });
+    let entity = registry
+        .players
+        .entry(entity_id)
+        .or_insert_with(|| PlayerState::fresh(position, velocity, true));
 
     entity.position = position;
     entity.velocity = velocity;
@@ -449,7 +581,7 @@ fn handle_gameplay_message(
             if data.len() >= 5 {
                 let client_id = u32::from_le_bytes(data[1..5].try_into().unwrap());
 
-                let player = ensure_player(registry, client_id, config.shard_id);
+                let player = ensure_player(registry, client_id, config.shard_id, config.shard_width);
                 if data.len() >= 21 {
                     let mut input = [0u8; 16];
                     input.copy_from_slice(&data[5..21]);
@@ -497,8 +629,8 @@ fn handle_gameplay_message(
                 handle_crossing_alert(broker, registry, config, entity_id, owning, target);
             }
         }
-        0x10 => {
-            // Eh
+        0x10 | 0x11 | 0x40 | 0x41 => {
+            // Neighbour world / enemy / stats traffic on subscribed snapshot topics; ignore.
         }
         tag => {
             println!("Received unknown gameplay tag: {}", tag);
@@ -572,6 +704,8 @@ fn drive_broker_session(mut broker: ResMut<BrokerConnection>, config: Res<Server
 
         send_control(&broker, PubSubOp::Sub, Topic::View(0));
 
+        send_control(&broker, PubSubOp::Sub, Topic::Input(0));
+
         broker.registered = true;
         println!("Registered pub/sub with broker.");
     }
@@ -589,7 +723,7 @@ fn simulate_and_publish(
     let player_ids: Vec<u32> = registry.players.keys().copied().collect();
     for client_id in player_ids {
         if let Some(player_state) = registry.players.get_mut(&client_id) {
-            let (left, right) = shard_bounds(config.shard_id);
+            let (left, right) = shard_bounds(config.shard_id, config.shard_width);
 
             match player_state.authority {
                 AuthorityState::Owned => {
@@ -597,15 +731,32 @@ fn simulate_and_publish(
 
                     if player_state.position.x < left {
                         player_state.position.x = left;
-                        player_state.velocity.x = player_state.velocity.x.abs();
+                        player_state.velocity.x =
+                            if player_state.bounce { player_state.velocity.x.abs() } else { 0.0 };
                     }
-
                     if player_state.position.x > right {
                         player_state.position.x = right;
-                        player_state.velocity.x = -player_state.velocity.x.abs();
+                        player_state.velocity.x =
+                            if player_state.bounce { -player_state.velocity.x.abs() } else { 0.0 };
                     }
 
-                    if let Some(target) = position_target_shard(player_state.position, config.shard_id) {
+                    if player_state.position.y < 0.0 {
+                        player_state.position.y = 0.0;
+                        player_state.velocity.y =
+                            if player_state.bounce { player_state.velocity.y.abs() } else { 0.0 };
+                    }
+                    if player_state.position.y > config.world_height {
+                        player_state.position.y = config.world_height;
+                        player_state.velocity.y =
+                            if player_state.bounce { -player_state.velocity.y.abs() } else { 0.0 };
+                    }
+
+                    if let Some(target) = position_target_shard(
+                        player_state.position,
+                        config.shard_id,
+                        config.shard_count,
+                        config.shard_width,
+                    ) {
                         if moving_toward(player_state.velocity, config.shard_id, target) {
                             player_state.authority = AuthorityState::PendingHandoff;
                             player_state.handoff_target = Some(target);
@@ -655,6 +806,238 @@ fn simulate_and_publish(
             if player_state.authority != AuthorityState::Ghost {
                 publish_entity_position(&broker, client_id, player_state);
             }
+        }
+    }
+}
+
+
+fn nearest_owned_player(registry: &PlayerRegistry, pos: Vec2) -> Option<(u32, Vec2)> {
+    registry
+        .players
+        .iter()
+        .filter(|(_, p)| p.authority == AuthorityState::Owned)
+        .min_by(|a, b| {
+            let da = a.1.position.distance_squared(pos);
+            let db = b.1.position.distance_squared(pos);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(&id, p)| (id, p.position))
+}
+
+fn spawn_enemies(
+    mut enemies: ResMut<EnemyRegistry>,
+    players: Res<PlayerRegistry>,
+    world: Res<ShardWorld>,
+    game: Res<GameState>,
+    config: Res<ServerConfig>,
+) {
+    enemies.spawn_clock += 1;
+    if enemies.spawn_clock < SPAWN_INTERVAL_TICKS {
+        return;
+    }
+    enemies.spawn_clock = 0;
+
+    if enemies.enemies.len() >= MAX_ENEMIES {
+        return;
+    }
+
+    let Some((target_id, target_pos)) = players
+        .players
+        .iter()
+        .find(|(_, p)| p.authority == AuthorityState::Owned)
+        .map(|(&id, p)| (id, p.position))
+    else {
+        return;
+    };
+
+    let Some(leaf) = world.tree.leaf_for(target_pos) else {
+        return;
+    };
+
+    // Spawn on a ring around the player, but keep it inside the leaf cell so the
+    // enemies survive the leaf cull. (In a small leaf the ring shrinks to fit.)
+    let leaf_half = (leaf.max.x - leaf.min.x).min(leaf.max.y - leaf.min.y) * 0.5;
+    let radius = ENEMY_SPAWN_RADIUS.min(leaf_half * 0.9).max(8.0);
+
+    // Wave scaling: bigger batches and tougher enemies as waves progress.
+    let batch = (SPAWN_BATCH + game.wave as usize).min(MAX_ENEMIES - enemies.enemies.len());
+    let enemy_hp = ENEMY_BASE_HP + game.wave as i32 / 2;
+
+    for _ in 0..batch {
+        let id = enemies.next_id;
+        enemies.next_id += 1;
+        let angle = rand_unit(&mut enemies.rng) * std::f32::consts::TAU;
+        let raw = target_pos + Vec2::new(angle.cos(), angle.sin()) * radius;
+        let position = Vec2::new(
+            raw.x.clamp(leaf.min.x, leaf.max.x),
+            raw.y.clamp(leaf.min.y, leaf.max.y),
+        );
+        enemies.enemies.insert(
+            id,
+            Enemy {
+                position,
+                velocity: Vec2::ZERO,
+                target: Some(target_id),
+                hp: enemy_hp,
+            },
+        );
+    }
+
+    println!(
+        "Shard {}: wave {} spawned {} enemies (total {})",
+        config.shard_id,
+        game.wave + 1,
+        batch,
+        enemies.enemies.len()
+    );
+}
+
+
+fn update_and_cull_enemies(
+    broker: Res<BrokerConnection>,
+    mut enemies: ResMut<EnemyRegistry>,
+    players: Res<PlayerRegistry>,
+    world: Res<ShardWorld>,
+    config: Res<ServerConfig>,
+) {
+    if broker.connection.is_none() || broker.unreliable_stream.is_none() || !broker.registered {
+        return;
+    }
+
+    let mut culled: Vec<u32> = Vec::new();
+    let enemy_ids: Vec<u32> = enemies.enemies.keys().copied().collect();
+
+    for id in enemy_ids {
+        let enemy_pos = enemies.enemies[&id].position;
+
+        let Some((player_id, player_pos)) = nearest_owned_player(&players, enemy_pos) else {
+            culled.push(id);
+            continue;
+        };
+
+        if !world.tree.same_leaf(enemy_pos, player_pos) {
+            culled.push(id);
+            continue;
+        }
+
+        let enemy = enemies.enemies.get_mut(&id).unwrap();
+        enemy.target = Some(player_id);
+        let direction = (player_pos - enemy.position).normalize_or_zero();
+        enemy.velocity = direction * ENEMY_SPEED;
+        enemy.position += enemy.velocity;
+        let pos = enemy.position;
+        publish_enemy_update(&broker, id, pos);
+    }
+
+    if !culled.is_empty() {
+        for id in &culled {
+            enemies.enemies.remove(id);
+            publish_enemy_despawn(&broker, *id);
+        }
+        println!(
+            "Shard {}: culled {} enemies outside player leaf ({} remaining)",
+            config.shard_id,
+            culled.len(),
+            enemies.enemies.len()
+        );
+    }
+}
+
+fn advance_waves(mut game: ResMut<GameState>) {
+    game.wave_clock += 1;
+    if game.wave_clock >= WAVE_INTERVAL_TICKS {
+        game.wave_clock = 0;
+        game.wave += 1;
+        println!("=== Wave {} ===", game.wave + 1);
+    }
+}
+
+fn publish_player_stats(broker: &BrokerConnection, client_id: u32, hp: i32, score: u32, wave: u32) {
+    let mut payload = Vec::with_capacity(1 + 4 + 4 + 4 + 4);
+    payload.push(0x11);
+    payload.extend_from_slice(&client_id.to_le_bytes());
+    payload.extend_from_slice(&hp.to_le_bytes());
+    payload.extend_from_slice(&score.to_le_bytes());
+    payload.extend_from_slice(&wave.to_le_bytes());
+    publish_gameplay(broker, &payload);
+}
+
+/// Player auto-attacks the nearest enemy in range; enemies deal contact damage;
+/// dead enemies award score; a dead player respawns. Publishes per-player stats.
+fn combat(
+    broker: Res<BrokerConnection>,
+    mut players: ResMut<PlayerRegistry>,
+    mut enemies: ResMut<EnemyRegistry>,
+    game: Res<GameState>,
+) {
+    if broker.connection.is_none() || broker.unreliable_stream.is_none() || !broker.registered {
+        return;
+    }
+
+    let player_ids: Vec<u32> = players.players.keys().copied().collect();
+    for pid in player_ids {
+        let Some((ppos, authority, mut atk_cd, mut dmg_cd)) = players
+            .players
+            .get(&pid)
+            .map(|p| (p.position, p.authority, p.attack_cd, p.damage_cd))
+        else {
+            continue;
+        };
+        if authority != AuthorityState::Owned {
+            continue;
+        }
+
+        atk_cd = atk_cd.saturating_sub(1);
+        dmg_cd = dmg_cd.saturating_sub(1);
+
+        let mut score_gain: u32 = 0;
+        let mut hp_delta: i32 = 0;
+
+        // Auto-attack: hit the nearest enemy within range.
+        if atk_cd == 0 {
+            let mut best: Option<(u32, f32)> = None;
+            for (&eid, e) in enemies.enemies.iter() {
+                let d = e.position.distance_squared(ppos);
+                if d <= ATTACK_RANGE * ATTACK_RANGE && best.map_or(true, |(_, bd)| d < bd) {
+                    best = Some((eid, d));
+                }
+            }
+            if let Some((eid, _)) = best {
+                atk_cd = ATTACK_COOLDOWN;
+                if let Some(e) = enemies.enemies.get_mut(&eid) {
+                    e.hp -= ATTACK_DAMAGE;
+                    if e.hp <= 0 {
+                        enemies.enemies.remove(&eid);
+                        publish_enemy_despawn(&broker, eid);
+                        score_gain += 1;
+                    }
+                }
+            }
+        }
+
+        // Contact damage: any enemy touching the player hurts (with i-frames).
+        if dmg_cd == 0 {
+            let touched = enemies
+                .enemies
+                .values()
+                .any(|e| e.position.distance_squared(ppos) <= CONTACT_RANGE * CONTACT_RANGE);
+            if touched {
+                hp_delta -= ENEMY_CONTACT_DAMAGE;
+                dmg_cd = PLAYER_DAMAGE_COOLDOWN;
+            }
+        }
+
+        if let Some(p) = players.players.get_mut(&pid) {
+            p.attack_cd = atk_cd;
+            p.damage_cd = dmg_cd;
+            p.score += score_gain;
+            p.hp += hp_delta;
+            if p.hp <= 0 {
+                p.hp = PLAYER_MAX_HP;
+                p.score = 0;
+                println!("Player {} died — respawning.", pid);
+            }
+            publish_player_stats(&broker, pid, p.hp, p.score, game.wave + 1);
         }
     }
 }

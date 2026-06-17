@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 bytes.workspace = true
 game_sockets.workspace = true
+glam.workspace = true
 serde.workspace = true
