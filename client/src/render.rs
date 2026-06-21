@@ -15,6 +15,7 @@ struct HudText;
 struct SpriteIndex {
     players: HashMap<u32, Entity>,
     enemies: HashMap<u32, Entity>,
+    projectiles: HashMap<u32, Entity>,
 }
 
 impl Plugin for RenderPlugin {
@@ -73,7 +74,6 @@ fn sync_world(
     mut index: ResMut<SpriteIndex>,
     mut transforms: Query<&mut Transform, Without<GameCamera>>,
 ) {
-    // --- Players ---
     for (&id, &pos) in world.players.iter() {
         let z = if id == local.id { 2.0 } else { 1.0 };
         if let Some(&entity) = index.players.get(&id) {
@@ -104,7 +104,6 @@ fn sync_world(
         }
     });
 
-    // --- Enemies ---
     for (&id, &pos) in world.enemies.iter() {
         if let Some(&entity) = index.enemies.get(&id) {
             if let Ok(mut t) = transforms.get_mut(entity) {
@@ -122,6 +121,30 @@ fn sync_world(
     }
     index.enemies.retain(|id, entity| {
         if world.enemies.contains_key(id) {
+            true
+        } else {
+            commands.entity(*entity).despawn();
+            false
+        }
+    });
+
+    for (&id, &pos) in world.projectiles.iter() {
+        if let Some(&entity) = index.projectiles.get(&id) {
+            if let Ok(mut t) = transforms.get_mut(entity) {
+                t.translation = Vec3::new(pos.x, pos.y, 3.0);
+            }
+        } else {
+            let entity = commands
+                .spawn((
+                    Sprite::from_color(Color::srgb(1.0, 0.95, 0.4), Vec2::splat(4.0)),
+                    Transform::from_xyz(pos.x, pos.y, 3.0),
+                ))
+                .id();
+            index.projectiles.insert(id, entity);
+        }
+    }
+    index.projectiles.retain(|id, entity| {
+        if world.projectiles.contains_key(id) {
             true
         } else {
             commands.entity(*entity).despawn();

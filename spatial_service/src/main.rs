@@ -99,11 +99,16 @@ fn connect_to_broker(mut commands: Commands, config: Res<ServiceConfig>) {
 }
 
 fn send_control(broker: &BrokerConnection, op: PubSubOp, topic: Topic) {
+    send_control_targeted(broker, op, topic, None);
+}
+
+fn send_control_targeted(broker: &BrokerConnection, op: PubSubOp, topic: Topic, target: Option<u32>) {
     if let (Some(conn), Some(reliable)) = (&broker.connection, &broker.reliable_stream) {
         let msg = PubSubMessage {
             op,
             topic,
             stream: broker.unreliable_stream.clone(),
+            target,
         };
         let _ = send_msg(&broker.peer, conn, reliable, &msg);
     }
@@ -144,13 +149,13 @@ fn handle_position_update(broker: &BrokerConnection, world: &mut World, data: &[
 
     let previous = world.entity_shard.insert(entity_id, current);
     if previous != Some(current) {
-        match previous {
-            Some(old) => println!(
-                "Entity {} moved shard {} -> {}: Unsubscribe(Snapshot({})) then Subscribe(Snapshot({}))",
-                entity_id, old, current, old, current
-            ),
-            None => println!("Entity {} entered shard {}: Subscribe(Snapshot({}))", entity_id, current, current),
+        if let Some(old) = previous {
+            send_control_targeted(broker, PubSubOp::StopSub, Topic::Snapshot(old), Some(entity_id));
+            println!("Entity {} moved shard {} -> {}: StopSub(Snapshot({})) + Sub(Snapshot({}))", entity_id, old, current, old, current);
+        } else {
+            println!("Entity {} entered shard {}: Sub(Snapshot({}))", entity_id, current, current);
         }
+        send_control_targeted(broker, PubSubOp::Sub, Topic::Snapshot(current), Some(entity_id));
     }
 
     let near = world.tree.shards_near(pos, HANDOFF_MARGIN);

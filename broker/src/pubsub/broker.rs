@@ -18,6 +18,7 @@ pub struct Broker {
 
     pub services: ServicesRegistry,
     pub topics: TopicsRegistry,
+    pub clients: HashMap<u32, GameConnection>,
 }
 
 impl Broker {
@@ -26,13 +27,48 @@ impl Broker {
             peer,
             services: ServicesRegistry(HashMap::new()),
             topics: TopicsRegistry(HashMap::new()),
+            clients: HashMap::new(),
         }
     }
 
-    pub fn is_existing_service(
-        &mut self,
-        connection: &GameConnection,
-    ) -> bool {
+    pub fn register_client_id(&mut self, client_id: u32, connection: GameConnection) {
+        self.clients.insert(client_id, connection);
+    }
+
+    pub fn force_subscribe_client(&mut self, client_id: u32, topic: Topic) {
+        let Some(&connection) = self.clients.get(&client_id) else {
+            return;
+        };
+        let stream = self
+            .services
+            .0
+            .get(&connection)
+            .and_then(|s| s.subscriptions.values().next().cloned());
+        let Some(stream) = stream else {
+            return;
+        };
+        self.subscribe(topic.clone(), connection, stream);
+        println!("Broker: forced client {} to subscribe {:?}", client_id, topic);
+    }
+
+    pub fn force_unsubscribe_client(&mut self, client_id: u32, topic: Topic) {
+        let Some(&connection) = self.clients.get(&client_id) else {
+            return;
+        };
+        let removed = self
+            .services
+            .0
+            .get_mut(&connection)
+            .and_then(|s| s.subscriptions.remove(&topic));
+        if let Some(stream) = removed {
+            if let Some(subs) = self.topics.0.get_mut(&topic) {
+                subs.remove(&Subscriber { connection, stream });
+            }
+            println!("Broker: forced client {} to unsubscribe {:?}", client_id, topic);
+        }
+    }
+
+    pub fn is_existing_service(&mut self, connection: &GameConnection) -> bool {
         self.services.0.contains_key(connection)
     }
 
@@ -44,15 +80,10 @@ impl Broker {
         if let Some(service) = self.services.0.get(&connection) {
             return service.is_lifeline_stream(&stream_reliable);
         }
-
         false
     }
 
-    pub fn register_service(
-        &mut self,
-        connection: &GameConnection,
-        stream_reliable: &GameStream,
-    ) {
+    pub fn register_service(&mut self, connection: &GameConnection, stream_reliable: &GameStream) {
         self.services.0.insert(
             *connection,
             Service {
@@ -64,114 +95,64 @@ impl Broker {
         );
     }
 
-    pub fn remove_service(
-        &mut self,
-        connection: &GameConnection,
-    ) {
+    pub fn remove_service(&mut self, connection: &GameConnection) {
         let (subscriptions, publications) = match self.services.0.get(&connection) {
             Some(service) => {
-                let subscriptions: Vec<Topic> =
-                    service.subscriptions.keys().cloned().collect();
-
-                let publications: Vec<Topic> =
-                    service.publications.values().cloned().collect();
-
+                let subscriptions: Vec<Topic> = service.subscriptions.keys().cloned().collect();
+                let publications: Vec<Topic> = service.publications.values().cloned().collect();
                 (subscriptions, publications)
             }
             None => return,
         };
 
-        // retire les abonnements
         for topic in subscriptions {
             self.unsubscribe(topic, *connection);
         }
-
-        // retire les topics publiés
         for topic in publications {
             self.suppress_topic(topic, *connection);
         }
-
-        /*
-        // notify the service of the end of its registration in the broker (basically expulsion)
-        if let Some(service) = self.services.0.remove(&connection) {
-            let end_msg = PubSubMessage {
-                op: PubSubOp::End,
-                topic: None,
-                stream: None,
-            };
-
-            let _ = send_msg(&self.peer, &connection, &service.stream_lifeline, &end_msg);
-        }
-        */
     }
 
-    pub fn create_topic(
-        &mut self,
-        topic: Topic,
-        connection: GameConnection,
-        stream: GameStream,
-    ) {
-        self.topics
-            .0
-            .entry(topic.clone())
-            .or_insert_with(HashSet::new);
+    pub fn create_topic(&mut self, topic: Topic, connection: GameConnection, stream: GameStream) {
+        self.topics.0.entry(topic.clone()).or_insert_with(HashSet::new);
 
         if let Some(service) = self.services.0.get_mut(&connection) {
             service.publications.insert(stream, topic);
         }
     }
 
-    pub fn forced_create_topic( 
-        &mut self,
-        topic: &Topic,
-        connection: &GameConnection,
-    ) {
+    pub fn forced_create_topic(&mut self, topic: &Topic, connection: &GameConnection) {
         let Some(service) = self.services.0.get(&connection) else {
             return;
         };
 
-        self.topics
-            .0
-            .entry(topic.clone())
-            .or_insert_with(HashSet::new);
+        self.topics.0.entry(topic.clone()).or_insert_with(HashSet::new);
 
         let forced_pub_msg = PubSubMessage {
             op: PubSubOp::ForcedPub,
             topic: topic.clone(),
-            stream : None,
+            stream: None,
+            target: None,
         };
 
         let _ = send_msg(&self.peer, &connection, &service.stream_lifeline, &forced_pub_msg);
     }
-    
 
-    pub fn suppress_topic(
-        &mut self,
-        topic: Topic,
-        connection: GameConnection,
-    ) {
+    pub fn suppress_topic(&mut self, topic: Topic, connection: GameConnection) {
         let subscribers = match self.topics.0.get(&topic) {
             Some(s) => s,
             None => return,
         };
-        
-        let subs: Vec<_> = subscribers.into_iter().cloned().collect();
 
+        let subs: Vec<_> = subscribers.into_iter().cloned().collect();
         for subscriber in subs {
             self.unsubscribe(topic.clone(), subscriber.connection)
         }
 
         if let Some(service) = self.services.0.get_mut(&connection) {
-            let stream = service
-                .publications
-                .iter()
-                .find_map(|(stream, t)| {
-                    if *t == topic {
-                        Some(stream.clone()) // ou Arc::clone(stream)
-                    } else {
-                        None
-                    }
-                });
+            let stream = service.publications.iter().find_map(|(stream, t)| {
+                if *t == topic { Some(stream.clone()) } else { None }
+            });
 
             if let Some(stream) = stream {
                 service.publications.remove(&stream);
@@ -185,18 +166,14 @@ impl Broker {
                 op: PubSubOp::StopPub,
                 topic: topic.clone(),
                 stream: None,
+                target: None,
             };
 
             let _ = send_msg(&self.peer, &connection, &service.stream_lifeline, &stop_pub_msg);
         }
     }
-    
-    pub fn subscribe( 
-        &mut self,
-        topic: Topic,
-        connection: GameConnection,
-        stream: GameStream,
-    ) { 
+
+    pub fn subscribe(&mut self, topic: Topic, connection: GameConnection, stream: GameStream) {
         let subscriber = Subscriber {
             connection,
             stream: stream.clone(),
@@ -213,27 +190,20 @@ impl Broker {
         }
     }
 
-    pub fn forced_subscribe( 
-        &mut self,
-        topic: &Topic,
-        connection: &GameConnection,
-    ) {
-        if let Some(service) = self.services.0.remove(&connection) {
+    pub fn forced_subscribe(&mut self, topic: &Topic, connection: &GameConnection) {
+        if let Some(service) = self.services.0.get(&connection) {
             let forced_sub_msg = PubSubMessage {
                 op: PubSubOp::ForcedSub,
                 topic: topic.clone(),
                 stream: None,
+                target: None,
             };
 
             let _ = send_msg(&self.peer, &connection, &service.stream_lifeline, &forced_sub_msg);
         }
     }
 
-    pub fn unsubscribe( 
-        &mut self,
-        topic: Topic,
-        connection: GameConnection,
-    ) {
+    pub fn unsubscribe(&mut self, topic: Topic, connection: GameConnection) {
         let Some(service) = self.services.0.get_mut(&connection) else {
             return;
         };
@@ -243,32 +213,15 @@ impl Broker {
         };
 
         if let Some(subscribers) = self.topics.0.get_mut(&topic) {
-            subscribers.remove(&Subscriber {
-                connection,
-                stream,
-            });
-        }
-        if let Some(service) = self.services.0.remove(&connection) {
-            let stop_sub_msg = PubSubMessage {
-                op: PubSubOp::StopSub,
-                topic,
-                stream: None,
-            };
-
-            let _ = send_msg(&self.peer, &connection, &service.stream_lifeline, &stop_sub_msg);
+            subscribers.remove(&Subscriber { connection, stream });
         }
     }
 
-    pub fn publish( 
-        &mut self,
-        connection: &GameConnection,
-        stream: &GameStream,
-        data: Bytes,
-    ) {
+    pub fn publish(&mut self, connection: &GameConnection, stream: &GameStream, data: Bytes) {
         let Some(service) = self.services.0.get(&connection) else {
             return;
         };
-    
+
         let Some(topic) = service.publications.get(&stream) else {
             return;
         };

@@ -12,16 +12,12 @@ pub fn send_msg<M: NetMessage>(
 ) -> Result<(), GameSocketError> {
     let mut serializer = Serializer::new();
 
-    // 1. écrire l'identifiant du message
     serializer.write_u8(M::ID as u8);
 
-    // 2. sérialiser le contenu
     msg.serialize(&mut serializer);
 
-    // 3. convertir en bytes
     let bytes = serializer.into_bytes();
 
-    // 4. envoyer
     peer.send(connection, stream, bytes)
 }
 
@@ -124,7 +120,7 @@ impl InputMessage {
         Self {
             inputs: [Input::default(); 20],
             len: 0,
-            latest: 0, // id of the latest input
+            latest: 0,
         }
     }
 
@@ -135,10 +131,8 @@ impl InputMessage {
             self.inputs[self.len] = input;
             self.len += 1;
         } else {
-            // Décale tout à gauche
             self.inputs.rotate_left(1);
 
-            // Remplace le plus récent
             self.inputs[self.inputs.len() - 1] = input;
         }
     }
@@ -247,23 +241,30 @@ pub struct PubSubMessage {
     pub op: PubSubOp,
     pub topic: Topic,
     pub stream: Option<GameStream>,
+    pub target: Option<u32>,
 }
 
 impl NetMessage for PubSubMessage {
     const ID: MessageId = MessageId::PubSub;
 
     fn serialize(&self, serializer: &mut Serializer) {
-        // 1. op
         serializer.write_u8(self.op as u8);
 
-        // 2. topic
         serializer.write_topic(&self.topic);
 
-        // 3. stream 
         match &self.stream {
             Some(stream) => {
                 serializer.write_bool(true);
                 serializer.write_u16(stream.stream_id);
+            }
+            None => {
+                serializer.write_bool(false);
+            }
+        }
+        match &self.target {
+            Some(target) => {
+                serializer.write_bool(true);
+                serializer.write_u32(*target);
             }
             None => {
                 serializer.write_bool(false);
@@ -295,6 +296,11 @@ impl NetMessage for PubSubMessage {
             false => None,
         };
 
-        Self { op, topic, stream }
+        let target = match deserializer.read_bool() {
+            true => Some(deserializer.read_u32()),
+            false => None,
+        };
+
+        Self { op, topic, stream, target }
     }
 }

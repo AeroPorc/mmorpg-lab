@@ -21,6 +21,7 @@ pub struct LocalPlayer {
 pub struct WorldView {
     pub players: HashMap<u32, Vec2>,
     pub enemies: HashMap<u32, Vec2>,
+    pub projectiles: HashMap<u32, Vec2>,
 }
 
 #[derive(Resource, Default)]
@@ -70,9 +71,11 @@ fn setup_connection(client: ResMut<NetworkClient>, game_server: Res<GameServerIn
     }
 }
 
-fn connection_request(client: ResMut<NetworkClient>) {
+fn connection_request(client: ResMut<NetworkClient>, local: Res<LocalPlayer>) {
     if let (Some(connection), Some(stream)) = (&client.connection, &client.reliable_stream) {
-        let _ = client.peer.send(connection, stream, "JOIN player".into());
+
+        let join = format!("JOIN {}", local.id);
+        let _ = client.peer.send(connection, stream, join.into());
     }
 }
 
@@ -90,6 +93,7 @@ fn register_pubsub(mut client: ResMut<NetworkClient>) {
             op: PubSubOp::Pub,
             topic: Topic::Input(0),
             stream: stream.clone(),
+            target: None,
         };
         let _ = send_msg(&client.peer, connection, reliable, &pub_msg);
 
@@ -97,6 +101,7 @@ fn register_pubsub(mut client: ResMut<NetworkClient>) {
             op: PubSubOp::Sub,
             topic: Topic::Snapshot(0),
             stream,
+            target: None,
         };
         let _ = send_msg(&client.peer, connection, reliable, &sub_msg);
         true
@@ -148,6 +153,7 @@ pub fn network_poll(
                 client.registered = false;
                 world.players.clear();
                 world.enemies.clear();
+                world.projectiles.clear();
                 next_state.set(AppState::Disconnected);
             }
             GameNetworkEvent::StreamCreated(_connection, stream) => {
@@ -188,6 +194,18 @@ pub fn network_poll(
                         0x41 => {
                             if let Some(id) = read_u32(&data, 1) {
                                 world.enemies.remove(&id);
+                            }
+                        }
+                        0x50 => {
+                            if let (Some(id), Some(x), Some(y)) =
+                                (read_u32(&data, 1), read_f32(&data, 5), read_f32(&data, 9))
+                            {
+                                world.projectiles.insert(id, Vec2::new(x, y));
+                            }
+                        }
+                        0x51 => {
+                            if let Some(id) = read_u32(&data, 1) {
+                                world.projectiles.remove(&id);
                             }
                         }
                         0x11 => {
