@@ -18,7 +18,7 @@ fn main() {
 
     let mut peer = GamePeer::new(UdpBackend::new());
     peer.listen(&broker_config.ip, broker_config.port).expect("Failed to bind GamePeer");
-    println!("🚀 Broker Server listening on {}:{}", broker_config.ip, broker_config.port);
+    println!("Broker Server listening on {}:{}", broker_config.ip, broker_config.port);
 
     let mut broker = Broker::new(peer);
 
@@ -46,11 +46,19 @@ fn main() {
                                         broker.suppress_topic(pubsub_msg.topic, connection);
                                     }
                                     PubSubOp::Sub => {
-                                        let sub_stream = pubsub_msg.stream.unwrap_or(stream);
-                                        broker.subscribe(pubsub_msg.topic, connection, sub_stream);
+                                        if let Some(client_id) = pubsub_msg.target {
+                                            broker.force_subscribe_client(client_id, pubsub_msg.topic);
+                                        } else {
+                                            let sub_stream = pubsub_msg.stream.unwrap_or(stream);
+                                            broker.subscribe(pubsub_msg.topic, connection, sub_stream);
+                                        }
                                     }
                                     PubSubOp::StopSub => {
-                                        broker.unsubscribe(pubsub_msg.topic, connection);
+                                        if let Some(client_id) = pubsub_msg.target {
+                                            broker.force_unsubscribe_client(client_id, pubsub_msg.topic);
+                                        } else {
+                                            broker.unsubscribe(pubsub_msg.topic, connection);
+                                        }
                                     }
                                     PubSubOp::End => {
                                         broker.remove_service(&connection);
@@ -68,8 +76,9 @@ fn main() {
                     let msg = String::from_utf8_lossy(&data);
                     let msg = msg.trim();   
 
-                    if msg.starts_with("JOIN ") { 
-                        new_player_handler(&mut broker, &connection, &stream);
+                    if msg.starts_with("JOIN ") {
+                        let client_id = msg.trim_start_matches("JOIN ").trim().parse::<u32>().ok();
+                        new_player_handler(&mut broker, &connection, &stream, client_id);
                     }
 
                     continue;
@@ -91,9 +100,13 @@ pub fn new_player_handler(
     broker: &mut Broker,
     connection: &GameConnection,
     stream: &GameStream,
+    client_id: Option<u32>,
 ) {
     broker.register_service(&connection, &stream);
-                        
+    if let Some(id) = client_id {
+        broker.register_client_id(id, *connection);
+    }
+
     let response = format!("WELCOME t");
     let _ = broker.peer.send(&connection, &stream, Bytes::from(response));
 }

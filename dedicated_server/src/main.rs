@@ -6,15 +6,15 @@ use game_sockets::{GameConnection, GameNetworkEvent, GamePeer, GameStream, GameS
 use shared::messages::netmessage::{decode_msg, send_msg, AnyMessage, PubSubMessage, PubSubOp};
 use shared::messages::topics::Topic;
 use shared::spatial::{QuadTree, Rect};
+use shared::Heartbeat;
 use std::collections::HashMap;
 use std::env;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 use uuid::Uuid;
 
 const TICK_HZ: f64 = 20.0;
 
-// Arena defaults (overridable via env: ARENA_WIDTH / ARENA_HEIGHT / QUAD_DEPTH).
 const DEFAULT_SHARD_WIDTH: f32 = 256.0;
 const DEFAULT_WORLD_HEIGHT: f32 = 256.0;
 const DEFAULT_QUAD_DEPTH: u8 = 2;
@@ -24,26 +24,29 @@ const DUMMY_SPEED: f32 = 1.0;
 const PLAYER_SPEED: f32 = 6.0;
 const STATE_BYTES: usize = 64;
 
-// Enemy AI tuning.
 const ENEMY_SPEED: f32 = 6.0;
 const SPAWN_INTERVAL_TICKS: u32 = 20;
 const SPAWN_BATCH: usize = 8;
 const MAX_ENEMIES: usize = 200;
-// Enemies spawn on a ring this far from the player (clamped to its leaf cell).
 const ENEMY_SPAWN_RADIUS: f32 = 280.0;
 
-// Combat tuning.
 const PLAYER_MAX_HP: i32 = 100;
 const ENEMY_BASE_HP: i32 = 3;
 const ENEMY_CONTACT_DAMAGE: i32 = 6;
 const CONTACT_RANGE: f32 = 16.0;
-const PLAYER_DAMAGE_COOLDOWN: u8 = 12; // i-frames (~0.6s)
-const ATTACK_COOLDOWN: u8 = 6; // auto-attack every ~0.3s
-const ATTACK_RANGE: f32 = 130.0;
+const PLAYER_DAMAGE_COOLDOWN: u8 = 12; 
+const ATTACK_COOLDOWN: u8 = 6; 
+const ATTACK_RANGE: f32 = 200.0; 
 const ATTACK_DAMAGE: i32 = 1;
 
-// Waves: difficulty steps up every interval.
-const WAVE_INTERVAL_TICKS: u32 = 300; // ~15s
+const PROJECTILE_SPEED: f32 = 18.0; 
+const PROJECTILE_TTL: u8 = 45; 
+const PROJECTILE_HIT_RADIUS: f32 = 10.0;
+
+const WAVE_INTERVAL_TICKS: u32 = 300;
+
+const HEARTBEAT_INTERVAL_TICKS: u32 = 40; 
+const MAX_PLAYERS_PER_SHARD: usize = 64;
 
 #[derive(Resource)]
 pub struct ServerConfig {
@@ -54,6 +57,13 @@ pub struct ServerConfig {
     pub world_height: f32,
     pub quad_depth: u8,
     pub broker_addr: SocketAddr,
+    pub orch_addr: String,
+}
+
+#[derive(Resource)]
+pub struct HeartbeatSender {
+    pub socket: UdpSocket,
+    pub clock: u32,
 }
 
 impl ServerConfig {
@@ -69,6 +79,7 @@ impl ServerConfig {
                 .unwrap_or_else(|_| "127.0.0.1:7002".to_string())
                 .parse()
                 .expect("Invalid broker address"),
+            orch_addr: env::var("ORCH_ADDR").unwrap_or_else(|_| "127.0.0.1:6000".to_string()),
         }
     }
 }
@@ -151,6 +162,25 @@ impl Default for EnemyRegistry {
     }
 }
 
+pub struct Projectile {
+    pub position: Vec2,
+    pub velocity: Vec2,
+    pub owner: u32,
+    pub ttl: u8,
+}
+
+#[derive(Resource)]
+pub struct ProjectileRegistry {
+    pub projectiles: HashMap<u32, Projectile>,
+    pub next_id: u32,
+}
+
+impl Default for ProjectileRegistry {
+    fn default() -> Self {
+        Self { projectiles: HashMap::new(), next_id: 1 }
+    }
+}
+
 
 #[derive(Resource)]
 pub struct ShardWorld {
@@ -205,8 +235,9 @@ fn main() {
         .insert_resource(world)
         .init_resource::<PlayerRegistry>()
         .init_resource::<EnemyRegistry>()
+        .init_resource::<ProjectileRegistry>()
         .init_resource::<GameState>()
-        .add_systems(Startup, (connect_to_broker, maybe_spawn_test_entity))
+        .add_systems(Startup, (connect_to_broker, maybe_spawn_test_entity, setup_heartbeat))
         .add_systems(
             Update,
             (
@@ -217,10 +248,55 @@ fn main() {
                 spawn_enemies,
                 update_and_cull_enemies,
                 combat,
+                update_projectiles,
+                send_heartbeat,
             )
                 .chain(),
         )
         .run();
+}
+
+/// Bind the UDP socket used to send heartbeats to the orchestrator.
+fn setup_heartbeat(mut commands: Commands) {
+    match UdpSocket::bind("0.0.0.0:0") {
+        Ok(socket) => {
+            let _ = socket.set_nonblocking(true);
+            commands.insert_resource(HeartbeatSender { socket, clock: 0 });
+        }
+        Err(e) => eprintln!("Heartbeat socket bind failed: {:?}", e),
+    }
+}
+
+/// Every ~2s, send a fleet heartbeat (best-effort UDP) to the orchestrator so it
+/// knows this shard is alive and can respawn it if it dies.
+fn send_heartbeat(
+    hb: Option<ResMut<HeartbeatSender>>,
+    registry: Res<PlayerRegistry>,
+    config: Res<ServerConfig>,
+) {
+    let Some(mut hb) = hb else { return };
+    hb.clock += 1;
+    if hb.clock < HEARTBEAT_INTERVAL_TICKS {
+        return;
+    }
+    hb.clock = 0;
+
+    let players = registry
+        .players
+        .values()
+        .filter(|p| p.authority == AuthorityState::Owned)
+        .count();
+    let beat = Heartbeat {
+        id: config.id.clone(),
+        ip: "127.0.0.1".to_string(),
+        port: 0,
+        zone: config.shard_id.to_string(),
+        player_count: players,
+        max_players: MAX_PLAYERS_PER_SHARD,
+    };
+    if let Ok(json) = serde_json::to_string(&beat) {
+        let _ = hb.socket.send_to(json.as_bytes(), &config.orch_addr);
+    }
 }
 
 fn maybe_spawn_test_entity(mut registry: ResMut<PlayerRegistry>, config: Res<ServerConfig>) {
@@ -273,6 +349,7 @@ fn send_control(broker: &BrokerConnection, op: PubSubOp, topic: Topic) {
             op,
             topic,
             stream: broker.unreliable_stream.clone(),
+            target: None,
         };
         let _ = send_msg(&broker.peer, conn, reliable, &msg);
     }
@@ -300,6 +377,22 @@ fn publish_enemy_despawn(broker: &BrokerConnection, enemy_id: u32) {
     let mut payload = Vec::with_capacity(1 + 4);
     payload.push(0x41);
     payload.extend_from_slice(&enemy_id.to_le_bytes());
+    publish_gameplay(broker, &payload);
+}
+
+fn publish_projectile_update(broker: &BrokerConnection, id: u32, pos: Vec2) {
+    let mut payload = Vec::with_capacity(1 + 4 + 4 + 4);
+    payload.push(0x50);
+    payload.extend_from_slice(&id.to_le_bytes());
+    payload.extend_from_slice(&pos.x.to_le_bytes());
+    payload.extend_from_slice(&pos.y.to_le_bytes());
+    publish_gameplay(broker, &payload);
+}
+
+fn publish_projectile_despawn(broker: &BrokerConnection, id: u32) {
+    let mut payload = Vec::with_capacity(1 + 4);
+    payload.push(0x51);
+    payload.extend_from_slice(&id.to_le_bytes());
     publish_gameplay(broker, &payload);
 }
 
@@ -448,6 +541,19 @@ fn handle_handoff_request(
     state_blob: [u8; STATE_BYTES],
 ) {
     let (left, right) = shard_bounds(config.shard_id, config.shard_width);
+
+    // The DESTINATION decides whether to accept (spec direction). We validate that
+    // the entity is genuinely at this shard's frontier; a stray/out-of-region
+    // request is rejected, and the source will bounce off the boundary.
+    let near_frontier =
+        (position.x - left).abs() <= HANDOFF_MARGIN || (position.x - right).abs() <= HANDOFF_MARGIN;
+    if !near_frontier {
+        let reject = encode_handoff_ack(0x22, entity_id);
+        publish_gameplay(broker, &reject);
+        println!("Shard {}: rejected hand-off for entity {} (not at frontier)", config.shard_id, entity_id);
+        return;
+    }
+
     let source_shard = if position.x <= left + HANDOFF_MARGIN {
         config.shard_id.saturating_sub(1)
     } else if position.x >= right - HANDOFF_MARGIN {
@@ -629,8 +735,7 @@ fn handle_gameplay_message(
                 handle_crossing_alert(broker, registry, config, entity_id, owning, target);
             }
         }
-        0x10 | 0x11 | 0x40 | 0x41 => {
-            // Neighbour world / enemy / stats traffic on subscribed snapshot topics; ignore.
+        0x10 | 0x11 | 0x40 | 0x41 | 0x50 | 0x51 => {
         }
         tag => {
             println!("Received unknown gameplay tag: {}", tag);
@@ -787,10 +892,10 @@ fn simulate_and_publish(
                             player_state.handoff_ticks = 0;
                         }
 
+                        // Local safety abort: if no Accept arrives in time, the
+                        // source gives up and bounces. (HandoffReject itself is
+                        // sent by the destination, not here — see handle_handoff_request.)
                         if player_state.handoff_ticks > 30 {
-                            let reject = encode_handoff_ack(0x22, client_id);
-                            publish_gameplay(&broker, &reject);
-
                             player_state.authority = AuthorityState::Owned;
                             player_state.handoff_target = None;
                             player_state.handoff_ticks = 0;
@@ -854,12 +959,9 @@ fn spawn_enemies(
         return;
     };
 
-    // Spawn on a ring around the player, but keep it inside the leaf cell so the
-    // enemies survive the leaf cull. (In a small leaf the ring shrinks to fit.)
     let leaf_half = (leaf.max.x - leaf.min.x).min(leaf.max.y - leaf.min.y) * 0.5;
     let radius = ENEMY_SPAWN_RADIUS.min(leaf_half * 0.9).max(8.0);
 
-    // Wave scaling: bigger batches and tougher enemies as waves progress.
     let batch = (SPAWN_BATCH + game.wave as usize).min(MAX_ENEMIES - enemies.enemies.len());
     let enemy_hp = ENEMY_BASE_HP + game.wave as i32 / 2;
 
@@ -961,13 +1063,11 @@ fn publish_player_stats(broker: &BrokerConnection, client_id: u32, hp: i32, scor
     payload.extend_from_slice(&wave.to_le_bytes());
     publish_gameplay(broker, &payload);
 }
-
-/// Player auto-attacks the nearest enemy in range; enemies deal contact damage;
-/// dead enemies award score; a dead player respawns. Publishes per-player stats.
 fn combat(
     broker: Res<BrokerConnection>,
     mut players: ResMut<PlayerRegistry>,
-    mut enemies: ResMut<EnemyRegistry>,
+    enemies: Res<EnemyRegistry>,
+    mut projectiles: ResMut<ProjectileRegistry>,
     game: Res<GameState>,
 ) {
     if broker.connection.is_none() || broker.unreliable_stream.is_none() || !broker.registered {
@@ -990,32 +1090,35 @@ fn combat(
         atk_cd = atk_cd.saturating_sub(1);
         dmg_cd = dmg_cd.saturating_sub(1);
 
-        let mut score_gain: u32 = 0;
         let mut hp_delta: i32 = 0;
 
-        // Auto-attack: hit the nearest enemy within range.
         if atk_cd == 0 {
-            let mut best: Option<(u32, f32)> = None;
-            for (&eid, e) in enemies.enemies.iter() {
+            let mut best: Option<(Vec2, f32)> = None;
+            for e in enemies.enemies.values() {
                 let d = e.position.distance_squared(ppos);
                 if d <= ATTACK_RANGE * ATTACK_RANGE && best.map_or(true, |(_, bd)| d < bd) {
-                    best = Some((eid, d));
+                    best = Some((e.position, d));
                 }
             }
-            if let Some((eid, _)) = best {
+            if let Some((epos, _)) = best {
                 atk_cd = ATTACK_COOLDOWN;
-                if let Some(e) = enemies.enemies.get_mut(&eid) {
-                    e.hp -= ATTACK_DAMAGE;
-                    if e.hp <= 0 {
-                        enemies.enemies.remove(&eid);
-                        publish_enemy_despawn(&broker, eid);
-                        score_gain += 1;
-                    }
+                let dir = (epos - ppos).normalize_or_zero();
+                if dir != Vec2::ZERO {
+                    let id = projectiles.next_id;
+                    projectiles.next_id += 1;
+                    projectiles.projectiles.insert(
+                        id,
+                        Projectile {
+                            position: ppos,
+                            velocity: dir * PROJECTILE_SPEED,
+                            owner: pid,
+                            ttl: PROJECTILE_TTL,
+                        },
+                    );
                 }
             }
         }
 
-        // Contact damage: any enemy touching the player hurts (with i-frames).
         if dmg_cd == 0 {
             let touched = enemies
                 .enemies
@@ -1030,7 +1133,6 @@ fn combat(
         if let Some(p) = players.players.get_mut(&pid) {
             p.attack_cd = atk_cd;
             p.damage_cd = dmg_cd;
-            p.score += score_gain;
             p.hp += hp_delta;
             if p.hp <= 0 {
                 p.hp = PLAYER_MAX_HP;
@@ -1039,5 +1141,68 @@ fn combat(
             }
             publish_player_stats(&broker, pid, p.hp, p.score, game.wave + 1);
         }
+    }
+}
+
+
+fn update_projectiles(
+    broker: Res<BrokerConnection>,
+    mut projectiles: ResMut<ProjectileRegistry>,
+    mut enemies: ResMut<EnemyRegistry>,
+    mut players: ResMut<PlayerRegistry>,
+    config: Res<ServerConfig>,
+) {
+    if broker.connection.is_none() || broker.unreliable_stream.is_none() || !broker.registered {
+        return;
+    }
+
+    let arena_w = config.shard_width * config.shard_count as f32;
+    let ids: Vec<u32> = projectiles.projectiles.keys().copied().collect();
+    let mut dead: Vec<u32> = Vec::new();
+
+    for id in ids {
+        let (pos, owner, ttl) = {
+            let p = projectiles.projectiles.get_mut(&id).unwrap();
+            p.position += p.velocity;
+            p.ttl = p.ttl.saturating_sub(1);
+            (p.position, p.owner, p.ttl)
+        };
+
+        if ttl == 0 || pos.x < 0.0 || pos.y < 0.0 || pos.x > arena_w || pos.y > config.world_height {
+            dead.push(id);
+            continue;
+        }
+
+        let mut hit: Option<u32> = None;
+        for (&eid, e) in enemies.enemies.iter() {
+            if e.position.distance_squared(pos) <= PROJECTILE_HIT_RADIUS * PROJECTILE_HIT_RADIUS {
+                hit = Some(eid);
+                break;
+            }
+        }
+
+        if let Some(eid) = hit {
+            let mut killed = false;
+            if let Some(e) = enemies.enemies.get_mut(&eid) {
+                e.hp -= ATTACK_DAMAGE;
+                killed = e.hp <= 0;
+            }
+            if killed {
+                enemies.enemies.remove(&eid);
+                publish_enemy_despawn(&broker, eid);
+                if let Some(p) = players.players.get_mut(&owner) {
+                    p.score += 1;
+                }
+            }
+            dead.push(id);
+            continue;
+        }
+
+        publish_projectile_update(&broker, id, pos);
+    }
+
+    for id in dead {
+        projectiles.projectiles.remove(&id);
+        publish_projectile_despawn(&broker, id);
     }
 }

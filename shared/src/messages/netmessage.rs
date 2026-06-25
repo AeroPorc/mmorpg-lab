@@ -12,16 +12,12 @@ pub fn send_msg<M: NetMessage>(
 ) -> Result<(), GameSocketError> {
     let mut serializer = Serializer::new();
 
-    // 1. écrire l'identifiant du message
     serializer.write_u8(M::ID as u8);
 
-    // 2. sérialiser le contenu
     msg.serialize(&mut serializer);
 
-    // 3. convertir en bytes
     let bytes = serializer.into_bytes();
 
-    // 4. envoyer
     peer.send(connection, stream, bytes)
 }
 
@@ -247,6 +243,7 @@ pub struct PubSubMessage {
     pub op: PubSubOp,
     pub topic: Topic,
     pub stream: Option<GameStream>,
+    pub target: Option<u32>,
 }
 
 impl NetMessage for PubSubMessage {
@@ -264,6 +261,15 @@ impl NetMessage for PubSubMessage {
             Some(stream) => {
                 serializer.write_bool(true);
                 serializer.write_u16(stream.stream_id);
+            }
+            None => {
+                serializer.write_bool(false);
+            }
+        }
+        match &self.target {
+            Some(target) => {
+                serializer.write_bool(true);
+                serializer.write_u32(*target);
             }
             None => {
                 serializer.write_bool(false);
@@ -295,6 +301,11 @@ impl NetMessage for PubSubMessage {
             false => None,
         };
 
-        Self { op, topic, stream }
+        let target = match deserializer.read_bool() {
+            true => Some(deserializer.read_u32()),
+            false => None,
+        };
+
+        Self { op, topic, stream, target }
     }
 }

@@ -1,197 +1,164 @@
+use std::collections::HashMap;
+use std::env;
+use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use redis::Commands;
-use std::process::Command;
+
 use shared::Heartbeat;
 
-const ORCH_PORT: &str = "ORCH_PORT";
-const HOT_SERVERS_MIN: &str = "HOT_SERVERS_MIN";
-const HEARTBEAT_TTL: &str = "HEARTBEAT_TTL";
-const SCALER_INTERVAL: &str = "SCALER_INTERVAL";
-const REDIS_URL: &str = "REDIS_URL";
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
-struct OrchestratorState {
-    next_port: u16,
+struct Config {
+    orch_port: u16,
+    broker_addr: String,
+    shard_count: u32,
+    ttl: Duration,
+    supervise: Duration,
+    dummy_shard: Option<u32>,
+    redis_url: String,
 }
+
+impl Config {
+    fn from_env() -> Self {
+        Self {
+            orch_port: env::var("ORCH_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(6000),
+            broker_addr: env::var("BROKER_ADDR").unwrap_or_else(|_| "127.0.0.1:5000".to_string()),
+            shard_count: env::var("SHARD_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(2),
+            ttl: Duration::from_secs(
+                env::var("HEARTBEAT_TTL").ok().and_then(|v| v.parse().ok()).unwrap_or(10),
+            ),
+            supervise: Duration::from_millis(
+                env::var("SUPERVISE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000),
+            ),
+            dummy_shard: env::var("SPAWN_DUMMY_SHARD").ok().and_then(|v| v.parse().ok()),
+            redis_url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+        }
+    }
+}
+
+type Fleet = Arc<Mutex<HashMap<u32, Instant>>>;
 
 #[tokio::main]
 async fn main() {
-    let orch_port = std::env::var(ORCH_PORT).unwrap_or_else(|_| "6000".to_string());
-    let hot_servers_min: usize = std::env::var(HOT_SERVERS_MIN)
-        .unwrap_or_else(|_| "2".to_string())
-        .parse()
-        .unwrap_or(2);
-    let heartbeat_ttl: usize = std::env::var(HEARTBEAT_TTL)
-        .unwrap_or_else(|_| "15".to_string())
-        .parse()
-        .unwrap_or(15);
-    let scaler_interval: u64 = std::env::var(SCALER_INTERVAL)
-        .unwrap_or_else(|_| "5000".to_string())
-        .parse()
-        .unwrap_or(5000);
-    let redis_url = std::env::var(REDIS_URL).unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let config = Arc::new(Config::from_env());
 
-    let socket = UdpSocket::bind(format!("0.0.0.0:{}", orch_port))
+    let redis = redis::Client::open(config.redis_url.as_str())
+        .ok()
+        .and_then(|c| c.get_connection().ok());
+    let redis_ok = redis.is_some();
+    let redis = Arc::new(Mutex::new(redis));
+
+    let socket = UdpSocket::bind(format!("0.0.0.0:{}", config.orch_port))
         .await
-        .expect("Failed to bind UDP socket");
-    
-    let state = Arc::new(Mutex::new(OrchestratorState { next_port: 7000 }));
-    
-    let socket_listener = Arc::new(socket);
+        .expect("Failed to bind orchestrator UDP socket");
+    let socket = Arc::new(socket);
 
-    let redis_listener = redis_url.clone();
-    let redis_scaler = redis_url.clone();
+    println!(
+        "Orchestrator supervising {} shard(s) on :{} (broker {}, redis: {})",
+        config.shard_count,
+        config.orch_port,
+        config.broker_addr,
+        if redis_ok { "connected" } else { "unavailable — in-memory only" }
+    );
 
-    let state_scaler = Arc::clone(&state);
+    let fleet: Fleet = Arc::new(Mutex::new(HashMap::new()));
 
-    let heartbeat_task = tokio::spawn(async move {
-        heartbeat_listener(socket_listener, redis_listener, heartbeat_ttl).await
-    });
+    let hb_task = tokio::spawn(heartbeat_listener(
+        Arc::clone(&socket),
+        Arc::clone(&fleet),
+        Arc::clone(&redis),
+    ));
+    let sup_task = tokio::spawn(supervisor(Arc::clone(&config), Arc::clone(&fleet)));
 
-    let scaler_task = tokio::spawn(async move {
-        scaler_loop(
-            state_scaler,
-            redis_scaler,
-            hot_servers_min,
-            scaler_interval,
-        )
-        .await
-    });
-
-    let _ = tokio::join!(heartbeat_task, scaler_task);
+    let _ = tokio::join!(hb_task, sup_task);
 }
 
-async fn heartbeat_listener(socket: Arc<UdpSocket>, redis_url: String, ttl: usize) {
-    let mut buffer = [0; 1024];
-    
-    let client = match redis::Client::open(redis_url.as_str()) {
-        Ok(c) => c,
-        Err(_) => {
-            println!("Failed to connect to Redis");
-            return;
-        }
-    };
-
-    let mut conn = match client.get_connection() {
-        Ok(c) => c,
-        Err(_) => {
-            println!("Failed to get Redis connection");
-            return;
-        }
-    };
-
+async fn heartbeat_listener(
+    socket: Arc<UdpSocket>,
+    fleet: Fleet,
+    redis: Arc<Mutex<Option<redis::Connection>>>,
+) {
+    let mut buf = [0u8; 1024];
     loop {
-        match socket.recv_from(&mut buffer).await {
-            Ok((len, _addr)) => {
-                if let Ok(heartbeat_str) = std::str::from_utf8(&buffer[..len]) {
-                    if let Ok(heartbeat) = serde_json::from_str::<Heartbeat>(heartbeat_str) {
-                        let server_key = format!("server:{}", heartbeat.id);
-                        let status = if heartbeat.player_count >= heartbeat.max_players {
-                            "full"
-                        } else {
-                            "available"
-                        };
-                        
-                        let _: Result<(), _> = conn.hset_multiple(
-                            &server_key,
-                            &[
-                                ("id", heartbeat.id),
-                                ("ip", heartbeat.ip),
-                                ("port", heartbeat.port.to_string()),
-                                ("zone", heartbeat.zone),
-                                ("player_count", heartbeat.player_count.to_string()),
-                                ("max_players", heartbeat.max_players.to_string()),
-                                ("status", status.to_string()),
-                            ],
-                        );
+        let Ok((len, _addr)) = socket.recv_from(&mut buf).await else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&buf[..len]) else { continue };
+        let Ok(hb) = serde_json::from_str::<Heartbeat>(text) else { continue };
+        let Ok(shard_id) = hb.zone.parse::<u32>() else { continue };
 
-                        let _: Result<(), _> = conn.expire(&server_key, ttl as i64);
-                    }
-                }
-            }
-            Err(_) => {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
+        fleet.lock().await.insert(shard_id, Instant::now());
+        println!("Heartbeat from shard {} ({} players)", shard_id, hb.player_count);
+
+        if let Some(conn) = redis.lock().await.as_mut() {
+            use redis::Commands;
+            let key = format!("shard:{}", shard_id);
+            let _: Result<(), _> = conn.hset_multiple(
+                &key,
+                &[
+                    ("id", hb.id),
+                    ("zone", hb.zone),
+                    ("player_count", hb.player_count.to_string()),
+                    ("max_players", hb.max_players.to_string()),
+                    ("status", "alive".to_string()),
+                ],
+            );
+            let _: Result<(), _> = conn.expire(&key, 15);
         }
     }
 }
 
-async fn scaler_loop(
-    state: Arc<Mutex<OrchestratorState>>,
-    redis_url: String,
-    hot_servers_min: usize,
-    interval_secs: u64,
-) {
-    let client = match redis::Client::open(redis_url.as_str()) {
-        Ok(c) => c,
-        Err(_) => {
-            println!("Failed to connect to Redis for scaler");
-            return;
-        }
-    };
-
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(interval_secs));
-
+async fn supervisor(config: Arc<Config>, fleet: Fleet) {
+    let mut interval = tokio::time::interval(config.supervise);
     loop {
         interval.tick().await;
-
-        let mut conn = match client.get_connection() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let available = count_available_servers(&mut conn);
-
-        if available < hot_servers_min {
-            let needed = hot_servers_min - available;
-            for _ in 0..needed {
-                let mut state_guard = state.lock().await;
-                spawn_server(state_guard.next_port);
-                state_guard.next_port += 1;
+        let now = Instant::now();
+        let mut fleet = fleet.lock().await;
+        for shard_id in 0..config.shard_count {
+            let alive = fleet
+                .get(&shard_id)
+                .map(|seen| now.duration_since(*seen) <= config.ttl)
+                .unwrap_or(false);
+            if !alive {
+                spawn_shard(&config, shard_id);
+                fleet.insert(shard_id, now);
             }
         }
     }
 }
 
-fn count_available_servers(conn: &mut redis::Connection) -> usize {
-    let (_cursor, keys): (u64, Vec<String>) = match redis::cmd("SCAN")
-    .arg(0)
-    .arg("MATCH")
-    .arg("server:*")
-    .query(conn)
-    {
-        Ok(result) => result,
-        Err(err) => {
-            eprintln!("SCAN error: {:?}", err);
-            return 0;
-        }
+fn spawn_shard(config: &Config, shard_id: u32) {
+    println!("Shard {} missing — spawning.", shard_id);
+    let exe = if cfg!(windows) {
+        "target/debug/dedicated_server.exe"
+    } else {
+        "target/debug/dedicated_server"
     };
+    let mut cmd = Command::new(exe);
+    cmd.env("SHARD_ID", shard_id.to_string());
+    cmd.env("SHARD_COUNT", config.shard_count.to_string());
+    cmd.env("BROKER_ADDR", &config.broker_addr);
+    cmd.env("ORCH_ADDR", format!("127.0.0.1:{}", config.orch_port));
 
-    let mut available = 0;
-
-    for key in keys {
-        let status: Result<String, _> = conn.hget(&key, "status");
-        match status {
-            Ok(s) => {
-                if s == "available" {
-                    available += 1;
-                }
-            }
-            Err(err) => {
-                eprintln!("HGET error for {}: {:?}", key, err);
-            }
+    if config.dummy_shard == Some(shard_id) {
+        cmd.env("SPAWN_DUMMY", "1");
+    }
+    for key in ["ARENA_WIDTH", "ARENA_HEIGHT", "QUAD_DEPTH"] {
+        if let Ok(value) = env::var(key) {
+            cmd.env(key, value);
         }
     }
 
-    available
-}
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NEW_CONSOLE);
 
-fn spawn_server(port: u16) {
-    let _result = Command::new("cargo")
-        .arg("run")
-        .arg("-p")
-        .arg("dedicated_server")
-        .env("DS_PORT", port.to_string())
-        .spawn();
+    if let Err(e) = cmd.spawn() {
+        eprintln!("Failed to spawn shard {}: {:?}", shard_id, e);
+    }
 }
